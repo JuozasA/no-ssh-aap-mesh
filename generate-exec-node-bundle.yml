@@ -1,0 +1,418 @@
+---
+# generate-exec-node-bundle.yml
+# Generates a self-contained tarball for a hop or execution node that could
+# not be reached during the main installer run.
+#
+# Tasks execute ON the first controller node (where CA keys, receptor certs,
+# and automation-controller-task live). The output tarball is fetched back to
+# the installer machine automatically.
+#
+# Prerequisites:
+#   - Main installer has completed successfully on the controller
+#   - node_hostname exists in [execution_nodes] in inventory
+#   - node has _receptor_hostname, _receptor_type, receptor_peers set in inventory
+#   - community.crypto collection available (ships with AAP bundle)
+#
+# -----------------------------------------------------------------------
+# TWO MODES — set installer_on_controller accordingly:
+#
+#   Mode A — installer on a SEPARATE machine (default, installer_on_controller=false):
+#     The installer machine and the controller are different hosts.
+#     Container images are read from the installer machine's bundle/images/
+#     directory and pushed to the controller during staging.
+#     The output tarball is fetched back to the installer machine when done.
+#
+#     ansible-playbook -i inventory generate-exec-node-bundle.yml \
+#       -e node_hostname=<hostname>
+#
+#   Mode B — installer running ON the controller (installer_on_controller=true):
+#     The installer and the controller are the same host.
+#     Container images are read directly from the local bundle/images/ directory.
+#     The output tarball is left in ~/ on the same machine when done.
+#
+#     ansible-playbook -i inventory generate-exec-node-bundle.yml \
+#       -e node_hostname=<hostname> \
+#       -e installer_on_controller=true
+# -----------------------------------------------------------------------
+#
+# Run for the hop node:
+#   ansible-playbook -i inventory generate-exec-node-bundle.yml \
+#     -e node_hostname=ip-11-0-133-15.eu-west-2.compute.internal
+#
+# Run for the execution node:
+#   ansible-playbook -i inventory generate-exec-node-bundle.yml \
+#     -e node_hostname=ip-11-0-159-96.eu-west-2.compute.internal
+#
+# Optional overrides:
+#   -e installer_on_controller=true  Installer runs on the controller (see above)
+#   -e include_ee_images=false       Skip bundling EE images (execution nodes only)
+#   -e bundle_host=<hostname>        Use a specific controller (default: automationcontroller[0])
+#
+# Output:
+#   ~/receptor-bundle-<node_hostname>.tar.gz
+#
+# Then on the node (see install-exec-node.yml for details):
+#   tar -xzf receptor-bundle-<node_hostname>.tar.gz
+#   cd receptor-bundle-<node_hostname>/
+#   ansible-playbook install-exec-node.yml -i inventory.yml
+
+- name: "Generate receptor node bundle"
+  hosts: "{{ bundle_host | default('automationcontroller[0]') }}"
+  gather_facts: true
+
+  vars:
+    # node_hostname must be passed via -e and exist in [execution_nodes]
+    aap_base_dir:       "{{ ansible_user_dir }}/aap"
+    ca_tls_dir:         "{{ aap_base_dir }}/tls"
+    receptor_conf_dir:  "{{ aap_base_dir }}/receptor/etc"
+    bundle_staging_dir: "/tmp/receptor-bundle-{{ node_hostname }}"
+    # bundle_output is on the controller; it is fetched back to the installer at the end
+    bundle_output:      "/tmp/receptor-bundle-{{ node_hostname }}.tar.gz"
+    _installer_bundle_images:       "{{ playbook_dir }}/bundle/images"
+    _installer_bundle_collections:  "{{ playbook_dir }}/collections"
+    _collections_tmp_archive:       "/tmp/aap-bundle-collections-{{ node_hostname }}.tar.gz"
+
+    # Node properties from inventory _receptor_* vars.
+    # _node_peers prefers receptor_peers (the intent var) over _receptor_peers,
+    # because _receptor_peers may be set to [] to work around a Jinja2 attribute
+    # filter limitation in init.yml for excluded nodes.
+    _node_type:     "{{ hostvars[node_hostname]['_receptor_type'] }}"
+    _node_hostname: "{{ hostvars[node_hostname]['_receptor_hostname'] }}"
+    _node_peers:    "{{ hostvars[node_hostname]['receptor_peers'] | default(hostvars[node_hostname]['_receptor_peers']) | string | from_yaml }}"
+    _node_port:     "{{ hostvars[node_hostname]['_receptor_port']     | default(27199) }}"
+    _node_protocol: "{{ hostvars[node_hostname]['_receptor_protocol'] | default('tcp') }}"
+
+    # Receptor settings (mirrors installer role defaults)
+    receptor_log_level:       info
+    receptor_mintls13:        false
+    receptor_disable_tls:     false
+    receptor_disable_signing: false
+
+    # Container settings
+    receptor_image:       "registry.redhat.io/ansible-automation-platform-26/receptor-rhel9:latest"
+    container_log_driver: journald
+    include_ee_images:    true
+
+    # Installer location mode — controls whether image files are read from the
+    # Ansible control machine (false, default) or from the controller's local
+    # filesystem (true, when the installer runs on the controller itself).
+    # Override with:  -e installer_on_controller=true
+    installer_on_controller: false
+
+    # Certificate subject (matches AAP installer defaults)
+    cert_country:  US
+    cert_state:    "North Carolina"
+    cert_locality: Raleigh
+    cert_org:      "Red Hat"
+    cert_ou:       Ansible
+
+  pre_tasks:
+
+    - name: Validate node_hostname is defined and in inventory
+      ansible.builtin.assert:
+        that:
+          - node_hostname is defined
+          - node_hostname in groups.get('execution_nodes', [])
+          - hostvars[node_hostname]['_receptor_type'] is defined
+          - hostvars[node_hostname]['_receptor_hostname'] is defined
+          - hostvars[node_hostname]['_receptor_peers'] is defined
+        fail_msg: >-
+          node_hostname must be defined, present in [execution_nodes], and have
+          _receptor_type, _receptor_hostname, _receptor_peers set in inventory.
+
+    - name: Verify prerequisite files exist on this controller
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      register: _prereq_stat
+      loop:
+        - "{{ ca_tls_dir }}/ca.key"
+        - "{{ ca_tls_dir }}/ca.cert"
+        - "{{ receptor_conf_dir }}/signing_public.pem"
+
+    - name: Fail if any prerequisite file is missing
+      ansible.builtin.fail:
+        msg: "Missing: {{ item.item }}. Ensure the installer completed on this controller."
+      when: not item.stat.exists
+      loop: "{{ _prereq_stat.results }}"
+
+    - name: Detect receptor image from running container
+      ansible.builtin.command:
+        cmd: podman inspect receptor --format "{{ '{{' }}.ImageName{{ '}}' }}"
+      register: _running_receptor_image
+      changed_when: false
+      failed_when: false
+
+    - name: Use detected receptor image if available
+      ansible.builtin.set_fact:
+        receptor_image: "{{ _running_receptor_image.stdout | trim }}"
+      when:
+        - _running_receptor_image.rc == 0
+        - _running_receptor_image.stdout | trim | length > 0
+
+    - name: Show node and receptor image details
+      ansible.builtin.debug:
+        msg: |
+          Node      : {{ node_hostname }} ({{ _node_type }})
+          Hostname  : {{ _node_hostname }}
+          Peers     : {{ _node_peers | join(', ') }}
+          Image     : {{ receptor_image }}
+
+  tasks:
+
+    - name: Create bundle staging directory
+      ansible.builtin.file:
+        path: "{{ bundle_staging_dir }}"
+        state: directory
+        mode: '0700'
+
+    - name: Create bundle subdirectories
+      ansible.builtin.file:
+        path: "{{ bundle_staging_dir }}/{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - certs
+        - images
+
+    # TLS certificate — mirrors roles/receptor/tasks/tls.yml
+    - name: Generate node private key
+      community.crypto.openssl_privatekey:
+        path: "{{ bundle_staging_dir }}/certs/receptor.key"
+        mode: '0400'
+
+    - name: Generate CSR for node
+      community.crypto.openssl_csr_pipe:
+        common_name: "{{ _node_hostname }}"
+        country_name: "{{ cert_country }}"
+        state_or_province_name: "{{ cert_state }}"
+        locality_name: "{{ cert_locality }}"
+        organization_name: "{{ cert_org }}"
+        organizational_unit_name: "{{ cert_ou }}"
+        subject_alt_name:
+          - "{{ _node_hostname | ansible.containerized_installer.subject_alt_name }}"
+          - "otherName:1.3.6.1.4.1.2312.19.1;UTF8:{{ _node_hostname }}"
+        privatekey_path: "{{ bundle_staging_dir }}/certs/receptor.key"
+      register: _receptor_tls_csr
+
+    - name: Sign node certificate with mesh CA
+      community.crypto.x509_certificate:
+        path: "{{ bundle_staging_dir }}/certs/receptor.crt"
+        csr_content: "{{ _receptor_tls_csr.csr }}"
+        privatekey_path: "{{ bundle_staging_dir }}/certs/receptor.key"
+        provider: ownca
+        ownca_path: "{{ ca_tls_dir }}/ca.cert"
+        ownca_privatekey_path: "{{ ca_tls_dir }}/ca.key"
+        ownca_privatekey_passphrase: "{{ ca_tls_key_passphrase | default(omit) }}"
+        mode: '0640'
+
+    - name: Copy mesh CA certificate into bundle
+      # Use ca.cert (the AAP mesh CA only) rather than the rendered mesh-CA.crt.
+      # mesh-CA.crt is produced by mesh-CA.crt.j2 and may concatenate additional
+      # CA certificates (e.g. custom_ca_cert, system CAs), which can push the bundle
+      # over receptor's 16KB QUIC crypto buffer limit, causing:
+      #   CRYPTO_BUFFER_EXCEEDED: received invalid offset NNN, maximum allowed 16384
+      # The receptor mesh only needs the AAP mesh CA to authenticate peer certificates.
+      ansible.builtin.copy:
+        src: "{{ ca_tls_dir }}/ca.cert"
+        dest: "{{ bundle_staging_dir }}/certs/mesh-CA.crt"
+        mode: '0644'
+        remote_src: true
+
+    - name: Copy work signing public key into bundle
+      ansible.builtin.copy:
+        src: "{{ receptor_conf_dir }}/signing_public.pem"
+        dest: "{{ bundle_staging_dir }}/certs/signing_public.pem"
+        mode: '0644'
+        remote_src: true
+
+    # CA trust bundle — receptor container mounts this at /etc/pki/ca-trust/extracted
+    - name: Archive CA trust extracted directory for bundle
+      ansible.builtin.command:
+        cmd: >-
+          tar -czf {{ bundle_staging_dir }}/ca-trust-extracted.tar.gz
+          -C {{ ca_tls_dir }}
+          extracted
+      changed_when: true
+
+    # Populate in-memory inventory so receptor.conf.j2 can resolve peer hostvars
+    - name: Add peer hosts to in-memory inventory for template rendering
+      ansible.builtin.add_host:
+        name: "{{ item }}"
+        _receptor_hostname: >-
+          {{ hostvars[item]['_receptor_hostname']
+             | default(hostvars[item]['ansible_host'] | default(item)) }}
+        _receptor_port:     "{{ hostvars[item]['_receptor_port']     | default(27199) }}"
+        _receptor_protocol: "{{ hostvars[item]['_receptor_protocol'] | default('tcp') }}"
+      loop: "{{ _node_peers }}"
+
+    # Set template variables — mirrors receptor/tasks/facts.yml set_fact outputs.
+    # The template uses both plain (receptor_*) and underscore-prefixed (_receptor_*)
+    # forms: plain forms drive the listener block; underscore forms drive peer blocks.
+    - name: Set template rendering variables
+      ansible.builtin.set_fact:
+        receptor_type:      "{{ _node_type }}"
+        receptor_port:      "{{ _node_port }}"
+        receptor_protocol:  "{{ _node_protocol }}"
+        _receptor_hostname: "{{ _node_hostname }}"
+        _receptor_type:     "{{ _node_type }}"
+        _receptor_port:     "{{ _node_port }}"
+        _receptor_protocol: "{{ _node_protocol }}"
+        _receptor_peers:    "{{ _node_peers }}"
+
+    - name: Generate receptor.conf from installer template
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/collections/ansible_collections/ansible/containerized_installer/roles/receptor/templates/receptor.conf.j2"
+        dest: "{{ bundle_staging_dir }}/receptor.conf"
+        mode: '0644'
+
+    # ----------------------------------------------------------------
+    # Images — copied directly from bundle/images/ on the installer.
+    #
+    # remote_src is driven by installer_on_controller:
+    #   false (default) → source is on the Ansible control machine (installer);
+    #                      Ansible pushes each file to the controller.
+    #   true            → source is already on the controller's local filesystem;
+    #                      Ansible reads it locally with remote_src: true.
+    #
+    # No podman save fallback needed — bundle/images/ always contains the
+    # pre-built tarballs shipped with the AAP bundle installer.
+    # ----------------------------------------------------------------
+    - name: Copy receptor image from installer bundle
+      ansible.builtin.copy:
+        src: "{{ _installer_bundle_images }}/receptor-rhel9.tar.gz"
+        dest: "{{ bundle_staging_dir }}/images/receptor-rhel9.tar.gz"
+        mode: '0644'
+        remote_src: "{{ installer_on_controller | bool }}"
+
+    - name: Copy EE images from installer bundle
+      # Execution nodes only — hop nodes only need the receptor image.
+      ansible.builtin.copy:
+        src: "{{ _installer_bundle_images }}/{{ item }}"
+        dest: "{{ bundle_staging_dir }}/images/{{ item }}"
+        mode: '0644'
+        remote_src: "{{ installer_on_controller | bool }}"
+      loop:
+        - ee-minimal-rhel9.tar.gz
+        - ee-supported-rhel9.tar.gz
+      when:
+        - include_ee_images | bool
+        - _node_type == 'execution'
+
+    # ----------------------------------------------------------------
+    # install-exec-node.yml — same remote_src logic as images above.
+    # ----------------------------------------------------------------
+    - name: Copy install-exec-node.yml into bundle
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/install-exec-node.yml"
+        dest: "{{ bundle_staging_dir }}/install-exec-node.yml"
+        mode: '0644'
+        remote_src: "{{ installer_on_controller | bool }}"
+
+    # ----------------------------------------------------------------
+    # Ansible collections — bundle containers.podman and ansible.posix
+    # so install-exec-node.yml can run offline on the node without
+    # needing internet access or RHEL AppStream collection RPMs.
+    #
+    # delegate_to: localhost archives on the installer machine regardless
+    # of Mode A (separate installer) or Mode B (installer on controller).
+    # ansible.builtin.unarchive then copies the archive to the controller
+    # staging dir and extracts it there (remote_src: false).
+    # ----------------------------------------------------------------
+    - name: Archive required Ansible collections on installer machine
+      ansible.builtin.command:
+        cmd: >-
+          tar -czf {{ _collections_tmp_archive }}
+          -C {{ _installer_bundle_collections }}
+          ansible_collections/containers/podman
+          ansible_collections/ansible/posix
+      delegate_to: localhost
+      changed_when: true
+
+    - name: Extract bundled collections into bundle staging directory
+      ansible.builtin.unarchive:
+        src: "{{ _collections_tmp_archive }}"
+        dest: "{{ bundle_staging_dir }}"
+        remote_src: false
+
+    - name: Generate ansible.cfg for bundle
+      # Tells ansible-playbook to search for collections in the bundle
+      # directory itself (i.e. ansible_collections/ extracted above).
+      ansible.builtin.copy:
+        dest: "{{ bundle_staging_dir }}/ansible.cfg"
+        mode: '0644'
+        content: |
+          [defaults]
+          # Collections are pre-bundled in ansible_collections/
+          collections_paths = .
+
+    - name: Generate inventory.yml for node
+      ansible.builtin.copy:
+        dest: "{{ bundle_staging_dir }}/inventory.yml"
+        mode: '0644'
+        content: |
+          ---
+          all:
+            hosts:
+              {{ node_hostname }}:
+                ansible_host: localhost
+                ansible_connection: local
+                # For remote execution: set ansible_connection: ssh, ansible_host: {{ _node_hostname }}, ansible_user, ansible_ssh_private_key_file
+
+            vars:
+              node_hostname: "{{ node_hostname }}"
+              node_type: "{{ _node_type }}"
+              receptor_port: {{ _node_port }}
+              receptor_protocol: "{{ _node_protocol }}"
+              receptor_image: "{{ receptor_image }}"
+              container_log_driver: "{{ container_log_driver }}"
+              bundle_dir: "{{ '{{' }} playbook_dir {{ '}}' }}"
+
+    # Register peer links in AWX DB — handles nodes whose peers were excluded
+    # from the main installer run (init.yml skips them when _receptor_peers=[]).
+    # awx-manage register_peers is idempotent, so safe to run on re-installs too.
+    - name: Register node peers in AWX database
+      ansible.builtin.command:
+        cmd: >-
+          podman exec automation-controller-task
+          awx-manage register_peers {{ _node_hostname }}
+          --exact {{ _node_peers | join(' ') }}
+      changed_when: true
+      when: _node_peers | length > 0
+
+    - name: Create bundle tarball
+      ansible.builtin.command:
+        cmd: >-
+          tar -czf {{ bundle_output }}
+          -C /tmp
+          receptor-bundle-{{ node_hostname }}
+      changed_when: true
+
+    - name: Remove staging directory
+      ansible.builtin.file:
+        path: "{{ bundle_staging_dir }}"
+        state: absent
+
+    # Fetch the tarball from the controller back to the installer machine
+    - name: Fetch bundle tarball to installer machine
+      ansible.builtin.fetch:
+        src: "{{ bundle_output }}"
+        dest: "{{ lookup('env', 'HOME') }}/{{ bundle_output | basename }}"
+        flat: true
+
+    - name: Remove tarball from controller after fetch
+      ansible.builtin.file:
+        path: "{{ bundle_output }}"
+        state: absent
+
+    - name: Display bundle summary
+      ansible.builtin.debug:
+        msg: |
+          Bundle: {{ lookup('env', 'HOME') }}/{{ bundle_output | basename }}
+          Node  : {{ node_hostname }} ({{ _node_type }})
+          Peers : {{ _node_peers | join(', ') }}
+          Image : {{ receptor_image }}
+
+          On the node:
+            tar -xzf {{ bundle_output | basename }}
+            cd receptor-bundle-{{ node_hostname }}/
+            ansible-playbook install-exec-node.yml -i inventory.yml
