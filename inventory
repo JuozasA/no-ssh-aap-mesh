@@ -1,0 +1,181 @@
+# This is the AAP enterprise installer inventory file
+# Please consult the docs if you're unsure what to add
+# For all optional variables please consult the included README.md
+# or the Red Hat documentation:
+# https://docs.redhat.com/en/documentation/red_hat_ansible_automation_platform/2.6/html/containerized_installation
+
+# This section is for your AAP Gateway host(s)
+# -----------------------------------------------------
+[automationgateway]
+ip-10-0-139-224.eu-west-2.compute.internal ansible_host=10.0.139.224
+ip-10-0-150-17.eu-west-2.compute.internal ansible_host=10.0.150.17
+
+# This section is for your AAP Controller host(s)
+# -----------------------------------------------------
+[automationcontroller]
+ip-10-0-131-147.eu-west-2.compute.internal
+ip-10-0-137-147.eu-west-2.compute.internal
+
+[automationcontroller:vars]
+# receptor_peers (no underscore) — prevents installer auto-assigning exec node directly to controllers
+receptor_peers=[]
+# _receptor_peers (with underscore) — init.yml Jinja2 workaround guard for excluded node processing
+_receptor_peers=[]
+
+# This section is for your AAP Automation Hub host(s)
+# -----------------------------------------------------
+[automationhub]
+ip-10-0-142-249.eu-west-2.compute.internal
+ip-10-0-159-132.eu-west-2.compute.internal
+
+# This section is for your AAP EDA Controller host(s)
+# -----------------------------------------------------
+[automationeda]
+ip-10-0-135-236.eu-west-2.compute.internal
+ip-10-0-132-94.eu-west-2.compute.internal
+
+# Execution / hop nodes
+# -----------------------------------------------------
+# Installer command (excludes non-SSH groups):
+#   ansible-playbook -i inventory ansible.containerized_installer.install \
+#     --limit 'all:!onprem_execution_nodes:!azure_execution_nodes'
+#
+# Non-SSH nodes (on-prem, Azure) are installed via generate-exec-node-bundle.yml
+# + install-exec-node.yml transferred and run on the node itself.
+
+[execution_nodes:children]
+aws_execution_nodes
+onprem_execution_nodes
+azure_execution_nodes
+
+[execution_nodes:vars]
+# Guard for excluded (non-SSH) nodes: init.yml on controllers iterates over ALL
+# execution_nodes via hostvars and reads _receptor_peers. Excluded nodes never
+# run facts.yml so _receptor_peers would be undefined → Jinja2 crash.
+# For SSH-accessible nodes this value is overridden at runtime by facts.yml set_fact.
+_receptor_peers=[]
+_receptor_protocol=tcp
+_receptor_port=27199
+
+# ── AWS execution nodes (SSH accessible — installer configures directly) ──────
+[aws_execution_nodes]
+# For SSH-accessible nodes facts.yml runs on the node and populates the
+# underscore-prefixed vars (_receptor_type, _system_uuid, _receptor_peers, …)
+# at runtime, so only the NO-underscore input variables are needed here:
+#
+#   receptor_type   → use 'hop' for hop nodes; omit for execution (role default = 'execution')
+#   receptor_peers  → computed automatically from topology; omit unless you need to override
+#   _system_uuid    → discovered from ansible_product_uuid / ansible_machine_id; omit
+#
+# Example:
+# aws-hop-1.eu-west-2.compute.internal  receptor_type=hop
+# aws-exec-1.eu-west-2.compute.internal receptor_peers=["aws-hop-1.eu-west-2.compute.internal"] 
+
+# ── On-prem execution nodes (no SSH — use generate-exec-node-bundle.yml) ─────
+[onprem_execution_nodes]
+ip-11-0-133-15.eu-west-2.compute.internal receptor_peers=["ip-10-0-131-147.eu-west-2.compute.internal","ip-10-0-137-147.eu-west-2.compute.internal"] _receptor_hostname=ip-11-0-133-15.eu-west-2.compute.internal _receptor_type=hop _system_uuid=ec2a2b88-a646-74b8-3053-e58334b2
+ip-11-0-159-96.eu-west-2.compute.internal receptor_peers=["ip-11-0-133-15.eu-west-2.compute.internal"] _receptor_hostname=ip-11-0-159-96.eu-west-2.compute.internal _receptor_type=execution _system_uuid=ec2824db-c7ab-bcde-b3a1-ca775cd
+
+# ── Azure execution nodes (no SSH — use generate-exec-node-bundle.yml) ───────
+[azure_execution_nodes]
+# Add Azure nodes here.
+# Example:
+# azure-hop-1.azure.internal receptor_peers=["ip-10-0-131-147.eu-west-2.compute.internal","ip-10-0-137-147.eu-west-2.compute.internal"] _receptor_hostname=azure-hop-1.azure.internal _receptor_type=hop _system_uuid=<uuid>
+# azure-exec-1.azure.internal receptor_peers=["azure-hop-1.azure.internal"] _receptor_hostname=azure-exec-1.azure.internal _receptor_type=execution _system_uuid=<uuid>
+
+# This section is for your AAP Lightspeed host(s)
+# -----------------------------------------------------
+# [ansiblelightspeed]
+# lightspeed1.example.org
+# lightspeed2.example.org
+
+# This section is for your Ansible MCP Server host(s)
+# -----------------------------------------------------
+# [ansiblemcp]
+# mcpserver1.example.org
+
+[redis]
+ip-10-0-139-224.eu-west-2.compute.internal
+ip-10-0-150-17.eu-west-2.compute.internal
+ip-10-0-142-249.eu-west-2.compute.internal
+ip-10-0-159-132.eu-west-2.compute.internal
+ip-10-0-135-236.eu-west-2.compute.internal
+ip-10-0-132-94.eu-west-2.compute.internal
+
+[all:vars]
+
+# Common variables
+# https://docs.redhat.com/en/documentation/red_hat_ansible_automation_platform/2.6/html/containerized_installation/appendix-inventory-files-vars#ref-general-inventory-variables
+# -----------------------------------------------------
+postgresql_admin_username=postgres
+postgresql_admin_password=
+ansible_env='{"PGSSLMODE": "require", "PGSSLROOTCERT": "/dev/null"}'
+bundle_install=true
+# The bundle directory must include /bundle in the path
+bundle_dir='{{ lookup("ansible.builtin.env", "PWD") }}/bundle'
+
+# Tell the installer to use SSL
+pg_sslmode='verify-full'
+# Tell the installer where the AWS cert is
+custom_ca_cert='/home/ec2-user/global-bundle.pem'
+hub_shared_data_path=""
+
+
+# AAP Gateway
+# https://docs.redhat.com/en/documentation/red_hat_ansible_automation_platform/2.6/html/containerized_installation/appendix-inventory-files-vars#ref-gateway-variables
+# -----------------------------------------------------
+gateway_admin_password=
+gateway_pg_host=
+gateway_pg_database=gw-db
+gateway_pg_username=postgres-gw
+gateway_pg_password=
+
+# AAP Controller
+# https://docs.redhat.com/en/documentation/red_hat_ansible_automation_platform/2.6/html/containerized_installation/appendix-inventory-files-vars#ref-controller-variables
+# -----------------------------------------------------
+controller_admin_password=
+controller_pg_host=
+controller_pg_database=ctrl-db
+controller_pg_username=postgres-ctrl
+controller_pg_password=
+
+# AAP Automation Hub
+# https://docs.redhat.com/en/documentation/red_hat_ansible_automation_platform/2.6/html/containerized_installation/appendix-inventory-files-vars#ref-hub-variables
+# -----------------------------------------------------
+hub_admin_password=
+hub_pg_host=
+hub_pg_database=hub-db
+hub_pg_username=postgres-hub
+hub_pg_password=
+
+# AAP EDA Controller
+# https://docs.redhat.com/en/documentation/red_hat_ansible_automation_platform/2.6/html/containerized_installation/appendix-inventory-files-vars#event-driven-ansible-controller
+# -----------------------------------------------------
+eda_admin_password=
+eda_pg_host=
+eda_pg_database=eda-db
+eda_pg_username=postgres-eda
+eda_pg_password=
+
+# AAP Lightspeed
+# https://docs.redhat.com/en/documentation/red_hat_ansible_automation_platform/2.6/html/containerized_installation/appendix-inventory-files-vars#ref-lightspeed-variables
+# -----------------------------------------------------
+# lightspeed_admin_password=<set your own>
+# lightspeed_pg_host=externaldb.example.org
+# lightspeed_pg_password=<set your own>
+
+# In case chatbot is enabled, the default provider is "rhoai"
+# lightspeed_chatbot_model_url=<set your own>
+# lightspeed_chatbot_model_api_key=<set your own>
+# lightspeed_chatbot_model_id=<set your own>
+
+# In case "azure" provider
+# lightspeed_chatbot_default_provider = "azure"
+
+# In case "openai" provider
+# lightspeed_chatbot_default_provider = "openai"
+
+# lightspeed_mcp_controller_enabled=true
+# lightspeed_mcp_lightspeed_enabled=true
+# lightspeed_wca_model_api_key=<set your own>
+# lightspeed_wca_model_id=<set your own>
