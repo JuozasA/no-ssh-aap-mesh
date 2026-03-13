@@ -119,7 +119,7 @@ For non-SSH nodes (e.g. [nossh_execution_nodes]):
 -   receptor_peers MUST be set - the list of peers this node dials out to (JSON array format).
 
 Example Inventory file:
-[[https://github.com/JuozasA/no-ssh-aap-mesh/blob/main/inventory]{.underline}](https://github.com/JuozasA/no-ssh-aap-mesh/blob/main/inventory)
+[https://github.com/JuozasA/no-ssh-aap-mesh/blob/main/inventory]
 
 # **Step 2 - generate-exec-node-bundle.yml**
 
@@ -154,7 +154,7 @@ Two modes:
 Place this file in the installer root directory:
 
 generate-exec-node-bundle.yml -
-[[https://github.com/JuozasA/no-ssh-aap-mesh/blob/main/generate-exec-node-bundle.yml]{.underline}](https://github.com/JuozasA/no-ssh-aap-mesh/blob/main/generate-exec-node-bundle.yml)
+[https://github.com/JuozasA/no-ssh-aap-mesh/blob/main/generate-exec-node-bundle.yml]
 
 # **Step 3 - install-exec-node.yml**
 
@@ -189,7 +189,7 @@ install-exec-node.yml is packaged inside the bundle tarball and runs ON the hop/
 Place this file in the installer root directory:
 
 install-exec-node.yml -
-[[https://github.com/JuozasA/no-ssh-aap-mesh/blob/main/install-exec-node.yml]{.underline}](https://github.com/JuozasA/no-ssh-aap-mesh/blob/main/install-exec-node.yml)
+[https://github.com/JuozasA/no-ssh-aap-mesh/blob/main/install-exec-node.yml]
 
 # **Step 4 - Run the Main AAP Installer**
 
