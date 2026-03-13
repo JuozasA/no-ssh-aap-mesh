@@ -195,7 +195,7 @@ install-exec-node.yml -
 
 Run the installer, excluding non-SSH node groups:
 ```
-cd /home/ec2-user/ansible-automation-platform-containerized-setup-bundle-2.6-5-x86_64/
+cd /<path>/<to>/<bundle>/ansible-automation-platform-containerized-setup-bundle-2.6-5-x86_64/
 
 ansible-playbook -i inventory ansible.containerized_installer.install --limit 'all:!nossh_execution_nodes'
 ```
