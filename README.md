@@ -66,11 +66,11 @@ Add these group vars to [automationcontroller]. They prevent the installer from 
 automationcontroller-1.example.com
 automationcontroller-2.example.com
 
-**[automationcontroller:vars]**
+[automationcontroller:vars]
 # receptor_peers (no underscore) --- prevents installer auto-assigning exec node directly to controllers
-**receptor_peers=[]**
+receptor_peers=[]
 # _receptor_peers (with underscore) --- init.yml Jinja2 guard for excluded node processing
-**_receptor_peers=[]**
+_receptor_peers=[]
 ```
 Why both? The installer's init.yml reads **_receptor_peers** (underscore) from hostvars for ALL execution nodes to build receptor topology. For excluded (non-SSH) nodes, facts.yml never runs so **_receptor_peers** would be undefined causing template generation to crash. Setting **_receptor_peers=[]** everywhere prevents this.
 **receptor_peers** (no underscore) is the input variable that controls topology assignment.
@@ -79,22 +79,22 @@ Why both? The installer's init.yml reads **_receptor_peers** (underscore) from h
 
 Replace any existing [execution_nodes] section with this child-group pattern:
 ```
-**[execution_nodes:children]
+[execution_nodes:children]
 ssh_execution_nodes
-nossh_execution_nodes**
+nossh_execution_nodes
 
-**[execution_nodes:vars]
+[execution_nodes:vars]
 _receptor_peers=[]
 _receptor_protocol=tcp
-_receptor_port=27199**
+_receptor_port=27199
 
 [ssh_execution_nodes]
-ssh-hop-1.example.com **receptor_peers=["automationcontroller-1.example.com","automationcontroller-2.example.com"] receptor_type=hop**
-ssh-exec-1.example.com **receptor_peers=["aws-hop-1.example.com"] receptor_type=execution**
+ssh-hop-1.example.com receptor_peers=["automationcontroller-1.example.com","automationcontroller-2.example.com"] receptor_type=hop
+ssh-exec-1.example.com receptor_peers=["aws-hop-1.example.com"] receptor_type=execution
 
 [nossh_execution_nodes]
-no-ssh-hop.example.com **receptor_peers=["automationcontroller-1.example.com","automationcontroller-2.example.com"] _receptor_hostname=no-ssh-hop.example.com _receptor_type=hop _system_uuid=ec2a2b88-a646-74b8-3053-e2beec**
-no-ssh-exec.example.com **receptor_peers=["no-ssh-hop.example.com"] _receptor_hostname=on-prem-exec.example.com _receptor_type=execution _system_uuid=ec2824db-c7ab-bcde-b3a1-c7eee**
+no-ssh-hop.example.com receptor_peers=["automationcontroller-1.example.com","automationcontroller-2.example.com"] _receptor_hostname=no-ssh-hop.example.com _receptor_type=hop _system_uuid=ec2a2b88-a646-74b8-3053-e2beec
+no-ssh-exec.example.com receptor_peers=["no-ssh-hop.example.com"] _receptor_hostname=on-prem-exec.example.com _receptor_type=execution _system_uuid=ec2824db-c7ab-bcde-b3a1-c7eee
 ```
 ## **1c. Variable naming rules**
 
@@ -197,7 +197,7 @@ Run the installer, excluding non-SSH node groups:
 ```
 cd /home/ec2-user/ansible-automation-platform-containerized-setup-bundle-2.6-5-x86_64/
 
-ansible-playbook -i inventory ansible.containerized_installer.install **--limit 'all:!nossh_execution_nodes'**
+ansible-playbook -i inventory ansible.containerized_installer.install --limit 'all:!nossh_execution_nodes'
 ```
 This installs the control plane (Gateway, Controller, Hub, EDA) and any SSH-accessible execution nodes, but skips no-ssh nodes.
 
@@ -225,7 +225,7 @@ Output: ~/receptor-bundle-no-ssh-exec.example.com.tar.gz
 ```
 ## **5c. If installer runs on the controller (Mode B)**
 ```
-ansible-playbook -i inventory generate-exec-node-bundle.yml -e node_hostname=<hostname> **-e installer_on_controller=true**
+ansible-playbook -i inventory generate-exec-node-bundle.yml -e node_hostname=<hostname> -e installer_on_controller=true
 ```
 
 # **Step 6 - Transfer Bundle to the Node**
