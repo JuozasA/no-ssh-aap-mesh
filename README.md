@@ -24,7 +24,7 @@ Key concept --- receptor topology direction:
 
 # **Prerequisites**
 
-## **Node requirements (on-prem):**
+## **Node requirements:**
 
 -   RHEL 9.2+
 
