@@ -234,20 +234,15 @@
           extracted
       changed_when: true
 
-    # Populate in-memory inventory so receptor.conf.j2 can resolve peer hostvars
-    - name: Add peer hosts to in-memory inventory for template rendering
-      ansible.builtin.add_host:
-        name: "{{ item }}"
-        _receptor_hostname: >-
-          {{ hostvars[item]['_receptor_hostname']
-             | default(hostvars[item]['ansible_host'] | default(item)) }}
-        _receptor_port:     "{{ hostvars[item]['_receptor_port']     | default(27199) }}"
-        _receptor_protocol: "{{ hostvars[item]['_receptor_protocol'] | default('tcp') }}"
-      loop: "{{ _node_peers }}"
-
     # Set template variables — mirrors receptor/tasks/facts.yml set_fact outputs.
     # The template uses both plain (receptor_*) and underscore-prefixed (_receptor_*)
     # forms: plain forms drive the listener block; underscore forms drive peer blocks.
+    #
+    # IMPORTANT: This must run BEFORE adding peer hosts to inventory. If the
+    # controller is also a peer (common case), set_fact would overwrite the peer's
+    # _receptor_hostname with the target node's hostname, causing tcp-peer blocks
+    # to point to the wrong address. By setting facts first, then adding peers,
+    # the peer's correct _receptor_hostname takes precedence in hostvars.
     - name: Set template rendering variables
       ansible.builtin.set_fact:
         receptor_type:      "{{ _node_type }}"
@@ -258,6 +253,20 @@
         _receptor_port:     "{{ _node_port }}"
         _receptor_protocol: "{{ _node_protocol }}"
         _receptor_peers:    "{{ _node_peers }}"
+
+    # Populate in-memory inventory so receptor.conf.j2 can resolve peer hostvars.
+    # This MUST run after set_fact above — if the controller is a peer, add_host
+    # will (correctly) set its _receptor_hostname to the controller's hostname,
+    # overriding the target node hostname set above.
+    - name: Add peer hosts to in-memory inventory for template rendering
+      ansible.builtin.add_host:
+        name: "{{ item }}"
+        _receptor_hostname: >-
+          {{ hostvars[item]['_receptor_hostname']
+             | default(hostvars[item]['ansible_host'] | default(item)) }}
+        _receptor_port:     "{{ hostvars[item]['_receptor_port']     | default(27199) }}"
+        _receptor_protocol: "{{ hostvars[item]['_receptor_protocol'] | default('tcp') }}"
+      loop: "{{ _node_peers }}"
 
     - name: Generate receptor.conf from installer template
       ansible.builtin.template:
