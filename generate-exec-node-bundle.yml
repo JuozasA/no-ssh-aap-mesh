@@ -248,7 +248,6 @@
         receptor_type:      "{{ _node_type }}"
         receptor_port:      "{{ _node_port }}"
         receptor_protocol:  "{{ _node_protocol }}"
-        _receptor_hostname: "{{ _node_hostname }}"
         _receptor_type:     "{{ _node_type }}"
         _receptor_port:     "{{ _node_port }}"
         _receptor_protocol: "{{ _node_protocol }}"
@@ -273,6 +272,8 @@
         src: "{{ playbook_dir }}/collections/ansible_collections/ansible/containerized_installer/roles/receptor/templates/receptor.conf.j2"
         dest: "{{ bundle_staging_dir }}/receptor.conf"
         mode: '0644'
+      vars:
+        _receptor_hostname: "{{ _node_hostname }}"
 
     # ----------------------------------------------------------------
     # Images — copied directly from bundle/images/ on the installer.
