@@ -118,9 +118,6 @@ For non-SSH nodes (e.g. [nossh_execution_nodes]):
 
 -   receptor_peers MUST be set - the list of peers this node dials out to (JSON array format).
 
-Example Inventory file:
-[https://github.com/JuozasA/no-ssh-aap-mesh/blob/main/inventory]
-
 # **Step 2 - generate-exec-node-bundle.yml**
 
 ## **What this playbook does**
@@ -151,11 +148,6 @@ Two modes:
 
 -   Mode B (installer_on_controller=true): Installer runs on the same machine as the controller. Images are read locally.
 
-Place this file in the installer root directory:
-
-generate-exec-node-bundle.yml -
-[https://github.com/JuozasA/no-ssh-aap-mesh/blob/main/generate-exec-node-bundle.yml]
-
 # **Step 3 - install-exec-node.yml**
 
 ## **What this playbook does**
@@ -185,11 +177,6 @@ install-exec-node.yml is packaged inside the bundle tarball and runs ON the hop/
 11. Opens port `27199/tcp` in firewalld if running.
 
 12. Verifies the receptor service is active.
-
-Place this file in the installer root directory:
-
-install-exec-node.yml -
-[https://github.com/JuozasA/no-ssh-aap-mesh/blob/main/install-exec-node.yml]
 
 # **Step 4 - Run the Main AAP Installer**
 
