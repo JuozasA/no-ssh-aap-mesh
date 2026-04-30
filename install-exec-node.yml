@@ -283,11 +283,18 @@
       notify: Restart receptor
 
     - name: Deploy mesh CA certificate
+      # Tagged update_ca so this task can be re-run on its own to refresh just
+      # the mesh trust (e.g. after the controllers' mesh-CA.crt was updated by
+      # re-running the installer with custom_ca_cert, and a fresh bundle was
+      # produced for an existing node):
+      #   ansible-playbook install-exec-node.yml -i inventory.yml --tags update_ca
       ansible.builtin.copy:
         src: "{{ bundle_dir | default(playbook_dir) }}/certs/mesh-CA.crt"
         dest: "{{ receptor_conf_dir }}/mesh-CA.crt"
         mode: '0640'
       notify: Restart receptor
+      tags:
+        - update_ca
 
     - name: Deploy work signing public key
       # Mirrors roles/receptor/tasks/facts.yml — signing_public.pem is only
