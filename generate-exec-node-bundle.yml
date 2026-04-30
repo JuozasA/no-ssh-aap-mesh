@@ -81,6 +81,10 @@
     _node_peers:    "{{ hostvars[node_hostname]['receptor_peers'] | default(hostvars[node_hostname]['_receptor_peers']) | string | from_yaml }}"
     _node_port:     "{{ hostvars[node_hostname]['_receptor_port']     | default(27199) }}"
     _node_protocol: "{{ hostvars[node_hostname]['_receptor_protocol'] | default('tcp') }}"
+    # _system_uuid is read from inventory; required for awx-manage provision_instance.
+    # For SSH-accessible nodes the installer's facts.yml derives it; for excluded
+    # nodes (no SSH from installer), it must be set explicitly in inventory.
+    _node_uuid:     "{{ hostvars[node_hostname]['_system_uuid'] }}"
 
     # Receptor settings (mirrors installer role defaults)
     receptor_log_level:       info
@@ -99,12 +103,47 @@
     # Override with:  -e installer_on_controller=true
     installer_on_controller: false
 
-    # Certificate subject (matches AAP installer defaults)
+    # Certificate subject (matches AAP installer defaults).
+    # Used only when auto-generating a cert (i.e. when receptor_custom_cert is unset).
     cert_country:  US
     cert_state:    "North Carolina"
     cert_locality: Raleigh
     cert_org:      "Red Hat"
     cert_ou:       Ansible
+
+    # Custom certificate support — bring your own cert/key (e.g. signed by your
+    # corporate / enterprise CA instead of the AAP mesh CA). Leave both empty
+    # to auto-generate a cert/key signed by the AAP mesh CA (default behaviour).
+    #
+    # IMPORTANT — receptor enforces a per-node identity in the cert:
+    #   - CN must be the node hostname
+    #   - SAN dNSName must include the node hostname
+    #   - SAN otherName 1.3.6.1.4.1.2312.19.1 (UTF8 = node hostname) — receptor's
+    #     node-id OID; receptor verifies this against the peer's announced node id
+    # So you cannot share one cert across multiple exec nodes — each node needs
+    # its own cert/key with its own hostname embedded in the SANs.
+    #
+    # IMPORTANT — for the corporate CA to actually be trusted across the mesh,
+    # the controllers' mesh-CA.crt must already include it. Re-run the installer
+    # with `custom_ca_cert=/path/to/corp-ca.crt` set in the AAP inventory before
+    # generating bundles with custom certs. The installer will merge AAP CA +
+    # corp CA into mesh-CA.crt on each controller; this playbook then copies
+    # that merged file into the bundle (see "Copy mesh CA certificate" task below).
+    #
+    # Paths are LOCAL to the host running ansible-playbook (the Ansible
+    # controller / installer host), NOT the AAP controller. The stat check
+    # below uses delegate_to: localhost, and the copy tasks omit remote_src,
+    # so Ansible reads the files from this host and pushes them to the AAP
+    # controller as part of the bundle. This means you don't need to scp
+    # certs to the AAP controller before running the playbook.
+    #
+    # Example:
+    #   ansible-playbook generate-exec-node-bundle.yml -i inventory.yml \
+    #     -e node_hostname=ip-10-0-1-5... \
+    #     -e receptor_custom_cert=/path/to/receptor.crt \
+    #     -e receptor_custom_key=/path/to/receptor.key
+    receptor_custom_cert: ""   # path to corp-signed receptor.crt on the installer host
+    receptor_custom_key:  ""   # path to matching receptor.key on the installer host
 
   pre_tasks:
 
@@ -116,24 +155,68 @@
           - hostvars[node_hostname]['_receptor_type'] is defined
           - hostvars[node_hostname]['_receptor_hostname'] is defined
           - hostvars[node_hostname]['_receptor_peers'] is defined
+          - hostvars[node_hostname]['_system_uuid'] is defined
         fail_msg: >-
           node_hostname must be defined, present in [execution_nodes], and have
-          _receptor_type, _receptor_hostname, _receptor_peers set in inventory.
+          _receptor_type, _receptor_hostname, _receptor_peers, _system_uuid set
+          in inventory. _system_uuid is required for awx-manage provision_instance —
+          generate one with: python3 -c 'import uuid; print(uuid.uuid4())'
+
+    - name: Validate custom cert/key — both must be set together or both empty
+      ansible.builtin.assert:
+        that:
+          - (receptor_custom_cert | length > 0) == (receptor_custom_key | length > 0)
+        fail_msg: >-
+          receptor_custom_cert and receptor_custom_key must both be provided or
+          both be empty. Got cert='{{ receptor_custom_cert }}', key='{{ receptor_custom_key }}'.
 
     - name: Verify prerequisite files exist on this controller
       ansible.builtin.stat:
         path: "{{ item }}"
       register: _prereq_stat
-      loop:
-        - "{{ ca_tls_dir }}/ca.key"
-        - "{{ ca_tls_dir }}/ca.cert"
-        - "{{ receptor_conf_dir }}/signing_public.pem"
+      # ca.key is only needed when AUTO-generating the cert (we sign the CSR with it).
+      # When receptor_custom_cert is provided, we don't sign anything, so ca.key is not required.
+      # ca.cert and signing_public.pem are always needed (even with custom cert).
+      # The merged mesh-CA.crt is checked in a dedicated stat task below.
+      loop: >-
+        {{
+          ([ca_tls_dir + '/ca.key'] if receptor_custom_cert | length == 0 else [])
+          + [ca_tls_dir + '/ca.cert',
+             receptor_conf_dir + '/signing_public.pem',
+             receptor_conf_dir + '/mesh-CA.crt']
+        }}
 
     - name: Fail if any prerequisite file is missing
       ansible.builtin.fail:
         msg: "Missing: {{ item.item }}. Ensure the installer completed on this controller."
       when: not item.stat.exists
       loop: "{{ _prereq_stat.results }}"
+
+    - name: Verify custom cert/key files exist on the installer host (when provided)
+      # delegate_to: localhost so the stat runs against the host that's running
+      # ansible-playbook (the installer host), not the AAP controller. The copy
+      # tasks below match this — they read from the installer host and push the
+      # files to the AAP controller.
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      register: _custom_cert_stat
+      loop:
+        - "{{ receptor_custom_cert }}"
+        - "{{ receptor_custom_key }}"
+      when: receptor_custom_cert | length > 0
+      delegate_to: localhost
+      run_once: true
+
+    - name: Fail if a custom cert or key file is not found
+      ansible.builtin.fail:
+        msg: >-
+          Custom cert/key file not found on the installer host: {{ item.item }}.
+          Check receptor_custom_cert / receptor_custom_key paths.
+          (These paths are on the host running ansible-playbook, not the AAP controller.)
+      when:
+        - receptor_custom_cert | length > 0
+        - not item.stat.exists
+      loop: "{{ _custom_cert_stat.results }}"
 
     - name: Detect receptor image from running container
       ansible.builtin.command:
@@ -174,46 +257,95 @@
         - certs
         - images
 
-    # TLS certificate — mirrors roles/receptor/tasks/tls.yml
-    - name: Generate node private key
-      community.crypto.openssl_privatekey:
-        path: "{{ bundle_staging_dir }}/certs/receptor.key"
-        mode: '0400'
+    # TLS certificate — mirrors roles/receptor/tasks/tls.yml.
+    # Auto-generation block: skipped when receptor_custom_cert/key are provided.
+    - name: Auto-generate receptor TLS certificate signed by AAP mesh CA
+      when: receptor_custom_cert | length == 0
+      block:
 
-    - name: Generate CSR for node
-      community.crypto.openssl_csr_pipe:
-        common_name: "{{ _node_hostname }}"
-        country_name: "{{ cert_country }}"
-        state_or_province_name: "{{ cert_state }}"
-        locality_name: "{{ cert_locality }}"
-        organization_name: "{{ cert_org }}"
-        organizational_unit_name: "{{ cert_ou }}"
-        subject_alt_name:
-          - "{{ _node_hostname | ansible.containerized_installer.subject_alt_name }}"
-          - "otherName:1.3.6.1.4.1.2312.19.1;UTF8:{{ _node_hostname }}"
-        privatekey_path: "{{ bundle_staging_dir }}/certs/receptor.key"
-      register: _receptor_tls_csr
+        - name: Generate node private key
+          community.crypto.openssl_privatekey:
+            path: "{{ bundle_staging_dir }}/certs/receptor.key"
+            mode: '0400'
 
-    - name: Sign node certificate with mesh CA
-      community.crypto.x509_certificate:
-        path: "{{ bundle_staging_dir }}/certs/receptor.crt"
-        csr_content: "{{ _receptor_tls_csr.csr }}"
-        privatekey_path: "{{ bundle_staging_dir }}/certs/receptor.key"
-        provider: ownca
-        ownca_path: "{{ ca_tls_dir }}/ca.cert"
-        ownca_privatekey_path: "{{ ca_tls_dir }}/ca.key"
-        ownca_privatekey_passphrase: "{{ ca_tls_key_passphrase | default(omit) }}"
-        mode: '0640'
+        - name: Generate CSR for node
+          community.crypto.openssl_csr_pipe:
+            common_name: "{{ _node_hostname }}"
+            country_name: "{{ cert_country }}"
+            state_or_province_name: "{{ cert_state }}"
+            locality_name: "{{ cert_locality }}"
+            organization_name: "{{ cert_org }}"
+            organizational_unit_name: "{{ cert_ou }}"
+            subject_alt_name:
+              - "{{ _node_hostname | ansible.containerized_installer.subject_alt_name }}"
+              - "otherName:1.3.6.1.4.1.2312.19.1;UTF8:{{ _node_hostname }}"
+            privatekey_path: "{{ bundle_staging_dir }}/certs/receptor.key"
+          register: _receptor_tls_csr
 
-    - name: Copy mesh CA certificate into bundle
-      # Use ca.cert (the AAP mesh CA only) rather than the rendered mesh-CA.crt.
-      # mesh-CA.crt is produced by mesh-CA.crt.j2 and may concatenate additional
-      # CA certificates (e.g. custom_ca_cert, system CAs), which can push the bundle
-      # over receptor's 16KB QUIC crypto buffer limit, causing:
-      #   CRYPTO_BUFFER_EXCEEDED: received invalid offset NNN, maximum allowed 16384
-      # The receptor mesh only needs the AAP mesh CA to authenticate peer certificates.
+        - name: Sign node certificate with mesh CA
+          community.crypto.x509_certificate:
+            path: "{{ bundle_staging_dir }}/certs/receptor.crt"
+            csr_content: "{{ _receptor_tls_csr.csr }}"
+            privatekey_path: "{{ bundle_staging_dir }}/certs/receptor.key"
+            provider: ownca
+            ownca_path: "{{ ca_tls_dir }}/ca.cert"
+            ownca_privatekey_path: "{{ ca_tls_dir }}/ca.key"
+            ownca_privatekey_passphrase: "{{ ca_tls_key_passphrase | default(omit) }}"
+            mode: '0640'
+
+    # Custom certificate block: used when receptor_custom_cert/key are provided.
+    # The cert MUST already be signed by a CA whose root is in the controllers'
+    # mesh-CA.crt (typically: AAP mesh CA, or a corporate CA added via the
+    # installer's custom_ca_cert mechanism). Receptor also requires per-node
+    # SANs (see vars-section comment) — one cert cannot be reused across nodes.
+    #
+    # No remote_src: true here — Ansible reads the cert/key from the installer
+    # host (where ansible-playbook runs) and pushes them to the AAP controller.
+    # This matches the delegate_to: localhost stat check in pre_tasks.
+    - name: Copy custom receptor certificate into bundle
       ansible.builtin.copy:
-        src: "{{ ca_tls_dir }}/ca.cert"
+        src: "{{ receptor_custom_cert }}"
+        dest: "{{ bundle_staging_dir }}/certs/receptor.crt"
+        mode: '0640'
+      when: receptor_custom_cert | length > 0
+
+    - name: Copy custom receptor key into bundle
+      ansible.builtin.copy:
+        src: "{{ receptor_custom_key }}"
+        dest: "{{ bundle_staging_dir }}/certs/receptor.key"
+        mode: '0400'
+      when: receptor_custom_key | length > 0
+
+    # Mesh CA certificate — copy the controller's already-merged mesh-CA.crt.
+    # The installer renders mesh-CA.crt as (AAP mesh CA + custom_ca_cert if set)
+    # via roles/receptor/templates/mesh-CA.crt.j2 — so this file is the single
+    # source of truth for what the mesh trusts. By copying it (rather than just
+    # ca.cert), bundles for new nodes automatically inherit any corporate CA
+    # the installer was configured with.
+    #
+    # GUARD against receptor's QUIC 16KB crypto buffer limit:
+    # If the merged mesh-CA.crt is too large, the TLS handshake fails with:
+    #   CRYPTO_BUFFER_EXCEEDED: received invalid offset NNN, maximum allowed 16384
+    # We fail fast here with a clear message rather than ship a broken bundle.
+    - name: Stat merged mesh-CA.crt for QUIC size check
+      ansible.builtin.stat:
+        path: "{{ receptor_conf_dir }}/mesh-CA.crt"
+      register: _mesh_ca_stat
+
+    - name: Fail if mesh-CA.crt exceeds receptor's 16KB QUIC crypto buffer
+      ansible.builtin.fail:
+        msg: >-
+          {{ receptor_conf_dir }}/mesh-CA.crt is {{ _mesh_ca_stat.stat.size }} bytes,
+          which exceeds receptor's 16384-byte QUIC crypto buffer limit.
+          The TLS handshake on the new node would fail with CRYPTO_BUFFER_EXCEEDED.
+          Reduce the size of custom_ca_cert in the installer (e.g. ship only the
+          intermediate that signed receptor certs, not the full chain), re-run the
+          installer to regenerate mesh-CA.crt, then retry this playbook.
+      when: _mesh_ca_stat.stat.size >= 16384
+
+    - name: Copy merged mesh CA certificate into bundle
+      ansible.builtin.copy:
+        src: "{{ receptor_conf_dir }}/mesh-CA.crt"
         dest: "{{ bundle_staging_dir }}/certs/mesh-CA.crt"
         mode: '0644'
         remote_src: true
@@ -377,16 +509,61 @@
               container_log_driver: "{{ container_log_driver }}"
               bundle_dir: "{{ '{{' }} playbook_dir {{ '}}' }}"
 
-    # Register peer links in AWX DB — handles nodes whose peers were excluded
-    # from the main installer run (init.yml skips them when _receptor_peers=[]).
-    # awx-manage register_peers is idempotent, so safe to run on re-installs too.
+    # AWX database registration — mirrors roles/automationcontroller/tasks/init.yml
+    # for nodes excluded from the main installer run. Three steps in order:
+    #   1. provision_instance     — create the Instance row in AWX
+    #   2. add_receptor_address   — set the listen address/port for the node
+    #   3. register_peers         — create peer links from this node to its peers
+    # All three are idempotent so re-running this playbook is safe.
+
+    - name: Provision node instance in AWX database
+      # Mirrors init.yml "Register the execution/hop instances in the database".
+      # provision_instance prints "(changed: True)" only when a new Instance is
+      # created; subsequent runs print "(changed: False)" — so this is idempotent.
+      ansible.builtin.command:
+        cmd: >-
+          podman exec automation-controller-task
+          awx-manage provision_instance
+          --hostname={{ _node_hostname }}
+          --uuid={{ _node_uuid }}
+          --node_type={{ _node_type }}
+      register: _provision_instance
+      changed_when: "'(changed: True)' in _provision_instance.stdout"
+      retries: 5
+      delay: 6
+      until: _provision_instance is not failed
+
+    - name: Set receptor listener address for node
+      # Mirrors init.yml "Set the receptor listener port".
+      # --canonical marks this as the primary address for peer dialing.
+      ansible.builtin.command:
+        cmd: >-
+          podman exec automation-controller-task
+          awx-manage add_receptor_address
+          --instance={{ _node_hostname }}
+          --address={{ _node_hostname }}
+          --port={{ _node_port }}
+          --canonical
+      register: _receptor_address
+      changed_when: "'(changed: True)' in _receptor_address.stdout"
+      retries: 5
+      delay: 6
+      until: _receptor_address is not failed
+
     - name: Register node peers in AWX database
+      # Mirrors init.yml "Register other peers in the database".
+      # Skipped for nodes with no peers (e.g. controllers). Output "0 peer links
+      # added" indicates nothing changed; anything else means new links created.
       ansible.builtin.command:
         cmd: >-
           podman exec automation-controller-task
           awx-manage register_peers {{ _node_hostname }}
           --exact {{ _node_peers | join(' ') }}
-      changed_when: true
+      register: _register_peers
+      changed_when: not _register_peers.stdout | regex_search('^0 peer links added')
+      retries: 5
+      delay: 6
+      until: _register_peers is not failed
       when: _node_peers | length > 0
 
     - name: Create bundle tarball
