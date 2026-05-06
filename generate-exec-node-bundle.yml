@@ -81,6 +81,7 @@
     _node_peers:    "{{ hostvars[node_hostname]['receptor_peers'] | default(hostvars[node_hostname]['_receptor_peers']) | string | from_yaml }}"
     _node_port:     "{{ hostvars[node_hostname]['_receptor_port']     | default(27199) }}"
     _node_protocol: "{{ hostvars[node_hostname]['_receptor_protocol'] | default('tcp') }}"
+    _node_uuid:     "{{ hostvars[node_hostname]['_system_uuid'] }}"
 
     # Receptor settings (mirrors installer role defaults)
     receptor_log_level:       info
@@ -380,6 +381,41 @@
     # Register peer links in AWX DB — handles nodes whose peers were excluded
     # from the main installer run (init.yml skips them when _receptor_peers=[]).
     # awx-manage register_peers is idempotent, so safe to run on re-installs too.
+
+    - name: Provision node instance in AWX database
+      # Mirrors init.yml "Register the execution/hop instances in the database".
+      # provision_instance prints "(changed: True)" only when a new Instance is
+      # created; subsequent runs print "(changed: False)" — so this is idempotent.
+      ansible.builtin.command:
+        cmd: >-
+          podman exec automation-controller-task
+          awx-manage provision_instance
+          --hostname={{ _node_hostname }}
+          --uuid={{ _node_uuid }}
+          --node_type={{ _node_type }}
+      register: _provision_instance
+      changed_when: "'(changed: True)' in _provision_instance.stdout"
+      retries: 5
+      delay: 6
+      until: _provision_instance is not failed
+
+    - name: Set receptor listener address for node
+      # Mirrors init.yml "Set the receptor listener port".
+      # --canonical marks this as the primary address for peer dialing.
+      ansible.builtin.command:
+        cmd: >-
+          podman exec automation-controller-task
+          awx-manage add_receptor_address
+          --instance={{ _node_hostname }}
+          --address={{ _node_hostname }}
+          --port={{ _node_port }}
+          --canonical
+      register: _receptor_address
+      changed_when: "'(changed: True)' in _receptor_address.stdout"
+      retries: 5
+      delay: 6
+      until: _receptor_address is not failed
+
     - name: Register node peers in AWX database
       ansible.builtin.command:
         cmd: >-
