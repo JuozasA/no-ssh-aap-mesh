@@ -320,9 +320,11 @@
         remote_src: "{{ installer_on_controller | bool }}"
 
     # ----------------------------------------------------------------
-    # Ansible collections — bundle containers.podman and ansible.posix
-    # so install-exec-node.yml can run offline on the node without
-    # needing internet access or RHEL AppStream collection RPMs.
+    # Ansible collections — bundle containers.podman, ansible.posix and
+    # ansible.containerized_installer so install-exec-node.yml can run offline
+    # on the node without internet access or RHEL AppStream collection RPMs.
+    # containerized_installer (~2 MB) provides the subuid/subgid modules used
+    # by section 1b, mirroring the installer's roles/common/tasks/subids.yml.
     #
     # delegate_to: localhost archives on the installer machine regardless
     # of Mode A (separate installer) or Mode B (installer on controller).
@@ -336,6 +338,7 @@
           -C {{ _installer_bundle_collections }}
           ansible_collections/containers/podman
           ansible_collections/ansible/posix
+          ansible_collections/ansible/containerized_installer
       delegate_to: localhost
       changed_when: true
 
