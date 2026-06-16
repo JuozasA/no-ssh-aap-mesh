@@ -98,7 +98,7 @@
       become: true
 
     - name: Ensure container runtime packages are installed
-      # Mirrors common/defaults/main.yml podman_packages list.
+      # Mirrors common/defaults/main.yml podman_packages list exactly.
       # NB: podman-remote is intentionally NOT installed on the host — the
       # receptor image ships it, and the ~/aap/containers/podman wrapper
       # (mounted into the container at /usr/bin/podman) execs the container's
@@ -154,71 +154,25 @@
 
     # ------------------------------------------------------------------
     # 1b. Ensure subordinate UID/GID ranges for rootless containers
-    #     Mirrors roles/common/tasks/subids.yml, which runs the collection's
-    #     subuid/subgid modules to guarantee the service user owns a
-    #     65536-wide subordinate range (the module default). A new range is
-    #     placed at the next free id, or 100000 when the file is empty; an
-    #     existing entry keeps its start.
-    #
-    #     Reimplemented with ansible.builtin because the node-side bundle only
-    #     ships containers.podman + ansible.posix — neither the
-    #     ansible.containerized_installer collection (subuid/subgid modules)
-    #     nor community.general is present on the node.
-    #
-    #     Required in the out-of-band mesh-node workflow: the installer's
-    #     common role never runs on these nodes, so nothing else guarantees a
-    #     subordinate range. Without one, rootless podman cannot map UIDs for
-    #     EE containers. Runs before the podman socket starts (section 3),
-    #     matching the installer's ordering. Stock RHEL useradd already
-    #     allocates 65536, so this is normally an idempotent no-op.
-    #     The ^user: regexp only ever matches this user's own line.
-    - name: Ensure /etc/subuid and /etc/subgid exist
-      ansible.builtin.copy:
-        dest: "/etc/{{ item }}"
-        content: ""
-        force: false
-        owner: root
-        group: root
-        mode: '0644'
-      loop:
-        - subuid
-        - subgid
+    #     Mirrors roles/common/tasks/subids.yml exactly, using the installer's
+    #     own subuid/subgid modules — bundled into this tarball by
+    #     generate-exec-node-bundle.yml (ansible.containerized_installer is
+    #     small, ~2 MB, and resolves via the bundle's collections_paths).
+    #     They guarantee the service user owns a 65536-wide subordinate range
+    #     so rootless podman can map UIDs for EE containers. Runs before the
+    #     podman socket starts (section 3), matching the installer's ordering.
+    #     Required in the out-of-band mesh-node workflow: the installer's common
+    #     role never runs on these nodes, so nothing else guarantees a range.
+    # ------------------------------------------------------------------
+    - name: Ensure user has enough subuids in namespace
+      ansible.containerized_installer.subuid:
+        user: "{{ ansible_user_id }}"
       become: true
 
-    - name: Read current subordinate ID ranges
-      ansible.builtin.slurp:
-        src: "/etc/{{ item }}"
-      register: _subid_files
-      loop:
-        - subuid
-        - subgid
+    - name: Ensure user has enough subgids in namespace
+      ansible.containerized_installer.subgid:
+        group: "{{ ansible_user_id }}"
       become: true
-
-    - name: Ensure the service user owns a 65536-wide subordinate range
-      ansible.builtin.lineinfile:
-        path: "/etc/{{ _subid.item }}"
-        regexp: "^{{ ansible_user_id | regex_escape }}:"
-        line: "{{ ansible_user_id }}:{{ _start }}:65536"
-        owner: root
-        group: root
-        mode: '0644'
-      become: true
-      loop: "{{ _subid_files.results }}"
-      loop_control:
-        loop_var: _subid
-        label: "/etc/{{ _subid.item }}"
-      vars:
-        # Parse existing entries (skip blanks/comments) into [name, start, size]
-        _lines: "{{ (_subid.content | b64decode).splitlines() | map('trim') | select | reject('match', '^#') | list }}"
-        _entries: "{{ _lines | map('split', ':') | list }}"
-        # Next free id = highest (start + size) across all entries, else 100000
-        _starts: "{{ _entries | map(attribute=1) | map('int') | list }}"
-        _sizes: "{{ _entries | map(attribute=2) | map('int') | list }}"
-        _ends: "{{ _starts | zip(_sizes) | map('sum') | list }}"
-        _next_start: "{{ (_ends | max) if (_ends | length > 0) else 100000 }}"
-        # Keep this user's existing start if present; otherwise take next free
-        _user_lines: "{{ _lines | select('match', '^' ~ (ansible_user_id | regex_escape) ~ ':') | list }}"
-        _start: "{{ (_user_lines[0].split(':'))[1] if (_user_lines | length > 0) else _next_start }}"
 
     # ------------------------------------------------------------------
     # 1c. Host tuning for execution nodes
