@@ -98,12 +98,16 @@
       become: true
 
     - name: Ensure container runtime packages are installed
-      # Mirrors common/defaults/main.yml podman_packages list.
+      # Mirrors common/defaults/main.yml podman_packages list exactly.
+      # NB: podman-remote is intentionally NOT installed on the host — the
+      # receptor image ships it, and the ~/aap/containers/podman wrapper
+      # (mounted into the container at /usr/bin/podman) execs the container's
+      # /usr/bin/podman-remote. The host only runs the podman *service*
+      # (podman package) that podman-remote connects to via the socket.
       ansible.builtin.package:
         name:
           - crun
           - podman
-          - podman-remote
           - slirp4netns
           - fuse-overlayfs
         state: present
@@ -128,13 +132,178 @@
         name: "{{ ansible_user_id }}"
         groups: systemd-journal
         append: true
+      register: _journal_group
       become: true
+
+    - name: Disable lingering when the journal group changed
+      # Mirrors common/tasks/main.yml: when group membership changes, cycle
+      # lingering (disable then enable) so the user's systemd manager restarts
+      # and picks up the new group before the receptor container runs. The
+      # 'removes' guard makes this a no-op on a fresh node (no linger file yet).
+      ansible.builtin.command:
+        cmd: "loginctl disable-linger {{ ansible_user_id }}"
+        removes: "/var/lib/systemd/linger/{{ ansible_user_id }}"
+      become: true
+      when: _journal_group is changed
 
     - name: Enable lingering for the service user (containers survive logout)
       ansible.builtin.command:
         cmd: "loginctl enable-linger {{ ansible_user_id }}"
         creates: "/var/lib/systemd/linger/{{ ansible_user_id }}"
       become: true
+
+    # ------------------------------------------------------------------
+    # 1b. Ensure subordinate UID/GID ranges for rootless containers
+    #     Mirrors roles/common/tasks/subids.yml, which runs the collection's
+    #     subuid/subgid modules to guarantee the service user owns a
+    #     65536-wide subordinate range (the module default). A new range is
+    #     placed at the next free id, or 100000 when the file is empty; an
+    #     existing entry keeps its start.
+    #
+    #     Reimplemented with ansible.builtin because the node-side bundle only
+    #     ships containers.podman + ansible.posix — neither the
+    #     ansible.containerized_installer collection (subuid/subgid modules)
+    #     nor community.general is present on the node.
+    #
+    #     Required in the out-of-band mesh-node workflow: the installer's
+    #     common role never runs on these nodes, so nothing else guarantees a
+    #     subordinate range. Without one, rootless podman cannot map UIDs for
+    #     EE containers. Runs before the podman socket starts (section 3),
+    #     matching the installer's ordering. Stock RHEL useradd already
+    #     allocates 65536, so this is normally an idempotent no-op.
+    #     The ^user: regexp only ever matches this user's own line.
+    - name: Ensure /etc/subuid and /etc/subgid exist
+      ansible.builtin.copy:
+        dest: "/etc/{{ item }}"
+        content: ""
+        force: false
+        owner: root
+        group: root
+        mode: '0644'
+      loop:
+        - subuid
+        - subgid
+      become: true
+
+    - name: Read current subordinate ID ranges
+      ansible.builtin.slurp:
+        src: "/etc/{{ item }}"
+      register: _subid_files
+      loop:
+        - subuid
+        - subgid
+      become: true
+
+    - name: Ensure the service user owns a 65536-wide subordinate range
+      ansible.builtin.lineinfile:
+        path: "/etc/{{ _subid.item }}"
+        regexp: "^{{ ansible_user_id | regex_escape }}:"
+        line: "{{ ansible_user_id }}:{{ _start }}:65536"
+        owner: root
+        group: root
+        mode: '0644'
+      become: true
+      loop: "{{ _subid_files.results }}"
+      loop_control:
+        loop_var: _subid
+        label: "/etc/{{ _subid.item }}"
+      vars:
+        # Parse existing entries (skip blanks/comments) into [name, start, size]
+        _lines: "{{ (_subid.content | b64decode).splitlines() | map('trim') | select | reject('match', '^#') | list }}"
+        _entries: "{{ _lines | map('split', ':') | list }}"
+        # Next free id = highest (start + size) across all entries, else 100000
+        _starts: "{{ _entries | map(attribute=1) | map('int') | list }}"
+        _sizes: "{{ _entries | map(attribute=2) | map('int') | list }}"
+        _ends: "{{ _starts | zip(_sizes) | map('sum') | list }}"
+        _next_start: "{{ (_ends | max) if (_ends | length > 0) else 100000 }}"
+        # Keep this user's existing start if present; otherwise take next free
+        _user_lines: "{{ _lines | select('match', '^' ~ (ansible_user_id | regex_escape) ~ ':') | list }}"
+        _start: "{{ (_user_lines[0].split(':'))[1] if (_user_lines | length > 0) else _next_start }}"
+
+    # ------------------------------------------------------------------
+    # 1c. Host tuning for execution nodes
+    #     Mirrors the host_tuning role, which the installer applies to
+    #     execution_nodes when tune_host_limits is true (default). It sets the
+    #     kernel.keys / fs.inotify sysctls in /etc/sysctl.d/99-aap.conf, a nofile
+    #     ulimit for the service user in /etc/security/limits.d/99-aap-limits.conf,
+    #     and computes SystemD TasksMax = min(threads-max * 0.8, pid-max), which
+    #     becomes the containers.conf pids_limit in section 3 (mirrors
+    #     containers.conf.j2's __systemd_default_tasks_max precedence).
+    #
+    #     Must run before section 3 so __systemd_default_tasks_max is set when
+    #     containers.conf is written. Uses ansible.posix (bundled). Disable with
+    #     -e tune_host_limits=false. In the out-of-band mesh-node workflow the
+    #     installer never runs here, so this is the only place these limits apply.
+    - name: Apply host tuning
+      when: tune_host_limits | default(true) | bool
+      vars:
+        host_tuning_sysctl_fs_inotify_max_user_instances: 8192
+        host_tuning_sysctl_fs_inotify_max_user_watches: 524288
+        host_tuning_nofile_limit_soft: 524288
+        host_tuning_nofile_limit_hard: 524288
+      block:
+        - name: Read kernel threads-max and pid-max
+          ansible.builtin.slurp:
+            src: "{{ item }}"
+          register: _host_tuning_kernel
+          loop:
+            - /proc/sys/kernel/threads-max
+            - /proc/sys/kernel/pid_max
+
+        - name: Compute SystemD TasksMax (min of 80% threads-max and pid-max)
+          # Mirrors host_tuning/tasks/main.yml; consumed by containers.conf below.
+          ansible.builtin.set_fact:
+            __systemd_default_tasks_max: >-
+              {{ [ (_host_tuning_kernel.results[0].content | b64decode | trim | int * 0.8) | int,
+                   _host_tuning_kernel.results[1].content | b64decode | trim | int ] | min }}
+
+        - name: Compute kernel.keys.maxkeys
+          # Mirrors host_tuning/tasks/sysctl.yml.
+          ansible.builtin.set_fact:
+            _host_tuning_maxkeys: "{{ [(ansible_memtotal_mb | int // 100) + 100, 4096] | max }}"
+
+        - name: Compute kernel.keys.maxbytes
+          ansible.builtin.set_fact:
+            _host_tuning_maxbytes: "{{ [(_host_tuning_maxkeys | int) * 100, 409600] | max }}"
+
+        - name: Apply kernel.keys and fs.inotify sysctls in /etc/sysctl.d/99-aap.conf
+          ansible.posix.sysctl:
+            name: "{{ item.name }}"
+            value: "{{ item.value | string }}"
+            sysctl_set: true
+            state: present
+            reload: true
+            sysctl_file: /etc/sysctl.d/99-aap.conf
+          become: true
+          loop:
+            - { name: kernel.keys.maxkeys,                value: "{{ _host_tuning_maxkeys }}" }
+            - { name: kernel.keys.maxbytes,               value: "{{ _host_tuning_maxbytes }}" }
+            - { name: fs.inotify.max_user_instances,      value: "{{ host_tuning_sysctl_fs_inotify_max_user_instances }}" }
+            - { name: fs.inotify.max_user_watches,        value: "{{ host_tuning_sysctl_fs_inotify_max_user_watches }}" }
+          loop_control:
+            label: "{{ item.name }}={{ item.value }}"
+
+        - name: Ensure /etc/security/limits.d exists
+          ansible.builtin.file:
+            path: /etc/security/limits.d
+            state: directory
+            mode: '0755'
+            owner: root
+            group: root
+          become: true
+
+        - name: Configure nofile ulimit for the service user
+          # Mirrors host_tuning/templates/99-aap-limits.conf.j2.
+          ansible.builtin.copy:
+            dest: /etc/security/limits.d/99-aap-limits.conf
+            mode: '0644'
+            owner: root
+            group: root
+            content: |
+              # Set file descriptor limits for the user that runs aap containerized services
+              {{ ansible_user_id }} soft nofile {{ host_tuning_nofile_limit_soft }}
+              {{ ansible_user_id }} hard nofile {{ host_tuning_nofile_limit_hard }}
+          become: true
 
     # ------------------------------------------------------------------
     # 2. Create host directory structure
@@ -178,7 +347,9 @@
     #    override.conf.j2, podman wrapper).
     # ------------------------------------------------------------------
     - name: Configure podman runtime (containers.conf)
-      # Mirrors roles/common/templates/containers.conf.j2
+      # Mirrors roles/common/templates/containers.conf.j2, including its
+      # pids_limit precedence: the host_tuning-computed __systemd_default_tasks_max
+      # when set (section 1c), otherwise the static podman_default_pids_limit.
       ansible.builtin.copy:
         dest: "{{ ansible_user_dir }}/.config/containers/containers.conf"
         mode: '0644'
@@ -187,19 +358,14 @@
           runtime = "crun"
 
           [containers]
-          pids_limit = {{ podman_default_pids_limit }}
+          pids_limit = {{ __systemd_default_tasks_max | default(podman_default_pids_limit) }}
 
-    - name: Configure user-level podman storage.conf
-      # Ensures ALL podman CLI calls (including those inside generated systemd
-      # unit files) use the same custom storage path as the podman daemon.
-      ansible.builtin.copy:
-        dest: "{{ ansible_user_dir }}/.config/containers/storage.conf"
-        mode: '0644'
-        content: |
-          [storage]
-          driver = "overlay"
-          rootless_storage_path = "{{ aap_base_dir }}/containers/storage"
-
+    # NOTE: No user-level ~/.config/containers/storage.conf is created — the
+    # installer doesn't create one either. The custom aap store is scoped to
+    # the podman *socket* daemon via override.conf, and EE images are loaded
+    # into it with a per-load CONTAINERS_STORAGE_CONF env (section 7). The
+    # receptor image/container deliberately stay in podman's default rootless
+    # store (matching the installer's control-plane vs execution-plane split).
     - name: Create AAP-managed podman storage.conf
       # Mirrors roles/common/templates/storage.conf.j2.
       # Referenced by override.conf so the podman socket daemon uses it.
@@ -255,6 +421,44 @@
       args:
         creates: "{{ ca_tls_dir }}/extracted"
       changed_when: true
+
+    # ------------------------------------------------------------------
+    # 4b. Trust the Automation Hub container registry
+    #     Mirrors common/hub_registry.yml — lets podman on this node pull EE
+    #     images from the private Automation Hub over TLS at job runtime.
+    #     hub_registries (a list of "<host>:<port>") is captured from the
+    #     controller's own certs.d by generate-exec-node-bundle.yml and written
+    #     into inventory.yml. The ca.crt symlink targets the CA bundle restored
+    #     in section 4. No-op when there is no hub (empty/undefined list).
+    # ------------------------------------------------------------------
+    - name: Configure Automation Hub registry trust
+      when: hub_registries | default([]) | length > 0
+      vars:
+        _certsd: "{{ ansible_user_dir }}/.config/containers/certs.d"
+      block:
+        - name: Create hub registry certs.d directory
+          ansible.builtin.file:
+            path: "{{ _certsd }}/{{ item }}"
+            state: directory
+            mode: '0755'
+          loop: "{{ hub_registries }}"
+
+        - name: Link the AAP CA bundle as the registry ca.crt
+          ansible.builtin.file:
+            src: "{{ ca_tls_dir }}/extracted/pem/tls-ca-bundle.pem"
+            dest: "{{ _certsd }}/{{ item }}/ca.crt"
+            state: link
+            force: true
+          loop: "{{ hub_registries }}"
+
+        - name: Create hostname alias for :443 registries
+          ansible.builtin.file:
+            src: "{{ _certsd }}/{{ item }}"
+            dest: "{{ _certsd }}/{{ item.split(':')[0] }}"
+            state: link
+            force: true
+          loop: "{{ hub_registries }}"
+          when: item is search(':443$')
 
     # ------------------------------------------------------------------
     # 5. Deploy receptor config and TLS certificates
@@ -315,20 +519,32 @@
 
     # ------------------------------------------------------------------
     # 7. Load container images from bundle
-    #    Uses containers.podman.podman_load — mirrors how the installer
-    #    loads images via the podman daemon (storage handled automatically
-    #    via ~/.config/containers/storage.conf set in section 3).
+    #    Mirrors roles/common/tasks/main.yml, which loads images into two
+    #    separate stores:
+    #      - the receptor image is a CONTROL-PLANE image → podman's default
+    #        rootless store (no CONTAINERS_STORAGE_CONF). The receptor container
+    #        is created from here by the host podman CLI (section 9).
+    #      - EE images are EXECUTION-PLANE images → the custom aap store, loaded
+    #        with CONTAINERS_STORAGE_CONF so the podman socket daemon (pointed at
+    #        the aap store via override.conf) can run them when receptor spawns
+    #        work. Hop nodes have no EE tarballs, so that loop is a no-op there.
     # ------------------------------------------------------------------
-    - name: Find all container images in bundle
+    - name: Load the receptor image into the default rootless store
+      containers.podman.podman_load:
+        input: "{{ bundle_dir | default(playbook_dir) }}/images/receptor-rhel9.tar.gz"
+
+    - name: Find EE images in bundle (execution nodes only)
       ansible.builtin.find:
         paths: "{{ bundle_dir | default(playbook_dir) }}/images"
-        patterns: "*.tar.gz"
-      register: _bundle_images
+        patterns: "ee-*.tar.gz"
+      register: _bundle_ee_images
 
-    - name: Load container images into podman
+    - name: Load EE images into the custom aap execution-plane store
       containers.podman.podman_load:
         input: "{{ item.path }}"
-      loop: "{{ _bundle_images.files }}"
+      environment:
+        CONTAINERS_STORAGE_CONF: "{{ aap_storage_conf }}"
+      loop: "{{ _bundle_ee_images.files }}"
       loop_control:
         label: "{{ item.path | basename }}"
 
@@ -360,10 +576,12 @@
     #    Mirrors roles/receptor/tasks/containers.yml exactly.
     #
     #    containers.podman.podman_container with generate_systemd:
-    #      - Creates the container (state: created)
+    #      - Creates the container (state: created) via the host podman CLI,
+    #        which reads the receptor image from the default rootless store
+    #        (where section 7 loaded it) — same as the installer
     #      - Generates receptor.service into ~/.config/systemd/user/
-    #      - Uses the podman daemon socket — storage handled automatically
-    #        via the daemon's CONTAINERS_STORAGE_CONF (override.conf)
+    #      - The mounted podman socket (aap store via override.conf) is used at
+    #        runtime when receptor spawns EE containers, not to create receptor
     #      - recreate: true ensures re-runs apply updated config
     #
     #    Volume layout matches roles/receptor/tasks/facts.yml:
@@ -387,7 +605,7 @@
           - "{{ receptor_conf_dir }}/mesh-CA.crt:/etc/receptor/tls/ca/mesh-CA.crt:ro,z"
           - "receptor_run:/run/receptor:U"
           - "receptor_runner:/home/runner:U"
-          - "receptor_home:/home/{{ ansible_user_id }}:U"
+          - "receptor_home:{{ ansible_user_dir }}:U"
           - "receptor_data:/var/lib/receptor:U"
           - "/run/user/{{ ansible_user_uid }}/podman/podman.sock:/run/user/{{ ansible_user_uid }}/podman/podman.sock:z"
           - "{{ controller_data_dir }}/job_execution:{{ controller_data_dir }}/job_execution:z"
@@ -419,7 +637,7 @@
         security_opt:
           - label=disable
         env:
-          HOME: "/home/{{ ansible_user_id }}"
+          HOME: "{{ ansible_user_dir }}"
           RECEPTORCTL_SOCKET: /run/receptor/receptor.sock
           CONTAINER_HOST: "unix://run/user/{{ ansible_user_uid }}/podman/podman.sock"
         label:
@@ -451,6 +669,16 @@
       register: _firewalld_state
       changed_when: false
       failed_when: false
+
+    - name: Ensure python3-firewall is installed (required by the firewalld module)
+      # Mirrors common/firewalld.yml — ansible.posix.firewalld needs the firewall
+      # python bindings. Normally pulled in by the firewalld RPM, but the
+      # installer installs it explicitly; do the same when firewalld is running.
+      ansible.builtin.package:
+        name: python3-firewall
+        state: present
+      become: true
+      when: _firewalld_state.rc == 0
 
     - name: Open receptor port in firewall
       ansible.posix.firewalld:
