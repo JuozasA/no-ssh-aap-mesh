@@ -98,7 +98,7 @@
       become: true
 
     - name: Ensure container runtime packages are installed
-      # Mirrors common/defaults/main.yml podman_packages list exactly.
+      # Mirrors common/defaults/main.yml podman_packages list.
       # NB: podman-remote is intentionally NOT installed on the host — the
       # receptor image ships it, and the ~/aap/containers/podman wrapper
       # (mounted into the container at /usr/bin/podman) execs the container's
