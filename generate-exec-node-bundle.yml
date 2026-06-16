@@ -90,7 +90,7 @@
     receptor_disable_signing: false
 
     # Container settings
-    receptor_image:       "registry.redhat.io/ansible-automation-platform-26/receptor-rhel9:latest"
+    receptor_image:       "registry.redhat.io/ansible-automation-platform-27/receptor-rhel9:latest"
     container_log_driver: journald
     include_ee_images:    true
 
@@ -356,6 +356,25 @@
           # Collections are pre-bundled in ansible_collections/
           collections_paths = .
 
+    # ----------------------------------------------------------------
+    # Hub registry trust — mirror common/hub_registry.yml.
+    # The installer configures the controller itself to trust the Automation
+    # Hub container registry (a ~/.config/containers/certs.d/<host>:<port>
+    # entry), so read that exact host:port here and pass it to the node, which
+    # recreates the same trust against its own copy of the CA bundle (shipped
+    # in ca-trust-extracted.tar.gz). Empty when there is no hub.
+    # ----------------------------------------------------------------
+    - name: Discover hub registry trust dirs on the controller
+      ansible.builtin.find:
+        paths: "{{ ansible_user_dir }}/.config/containers/certs.d"
+        file_type: directory
+        recurse: false
+      register: _controller_certsd
+
+    - name: Capture hub registry host:port list for the node
+      ansible.builtin.set_fact:
+        _hub_registries: "{{ _controller_certsd.files | map(attribute='path') | map('basename') | list }}"
+
     - name: Generate inventory.yml for node
       ansible.builtin.copy:
         dest: "{{ bundle_staging_dir }}/inventory.yml"
@@ -376,6 +395,8 @@
               receptor_protocol: "{{ _node_protocol }}"
               receptor_image: "{{ receptor_image }}"
               container_log_driver: "{{ container_log_driver }}"
+              # Automation Hub registries this node should trust for EE pulls
+              hub_registries: {{ _hub_registries | to_json }}
               bundle_dir: "{{ '{{' }} playbook_dir {{ '}}' }}"
 
     # Register peer links in AWX DB — handles nodes whose peers were excluded
