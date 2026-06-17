@@ -614,35 +614,46 @@
         daemon_reload: true
 
     # ------------------------------------------------------------------
-    # 11. Open firewall port (if firewalld is running)
-    #     Mirrors roles/receptor/tasks/firewalld.yml.
+    # 11. Open firewall port (when firewalld is enabled)
+    #     Mirrors common/firewalld.yml (start firewalld + install
+    #     python3-firewall) and receptor/firewalld.yml (open the port). Keyed
+    #     off the service being *enabled* via service_facts — exactly like the
+    #     installer — so an enabled-but-stopped firewalld is started rather than
+    #     skipped, and 'immediate' then succeeds.
     # ------------------------------------------------------------------
-    - name: Check if firewalld is running
-      ansible.builtin.command:
-        cmd: firewall-cmd --state
-      register: _firewalld_state
-      changed_when: false
-      failed_when: false
-
-    - name: Ensure python3-firewall is installed (required by the firewalld module)
-      # Mirrors common/firewalld.yml — ansible.posix.firewalld needs the firewall
-      # python bindings. Normally pulled in by the firewalld RPM, but the
-      # installer installs it explicitly; do the same when firewalld is running.
-      ansible.builtin.package:
-        name: python3-firewall
-        state: present
+    - name: Gather service facts
+      ansible.builtin.service_facts:
       become: true
-      when: _firewalld_state.rc == 0
 
-    - name: Open receptor port in firewall
-      ansible.posix.firewalld:
-        port: "{{ receptor_port }}/{{ receptor_protocol }}"
-        permanent: true
-        state: enabled
-        immediate: true
-        zone: public
-      become: true
-      when: _firewalld_state.rc == 0
+    - name: Configure firewalld for the receptor port
+      when:
+        - ansible_facts.services.get('firewalld.service', {}) | length > 0
+        - ansible_facts.services['firewalld.service']['status'] == 'enabled'
+      block:
+        - name: Ensure firewalld is started
+          # Mirrors common/firewalld.yml.
+          ansible.builtin.service:
+            name: firewalld
+            state: started
+          become: true
+
+        - name: Ensure python3-firewall is installed (required by the firewalld module)
+          # Mirrors common/firewalld.yml — ansible.posix.firewalld needs the
+          # firewall python bindings.
+          ansible.builtin.package:
+            name: python3-firewall
+            state: present
+          become: true
+
+        - name: Open receptor port in firewall
+          # Mirrors receptor/firewalld.yml.
+          ansible.posix.firewalld:
+            port: "{{ receptor_port }}/{{ receptor_protocol }}"
+            permanent: true
+            state: enabled
+            immediate: true
+            zone: "{{ receptor_firewall_zone | default('public') }}"
+          become: true
 
     # ------------------------------------------------------------------
     # 12. Verify receptor is running
