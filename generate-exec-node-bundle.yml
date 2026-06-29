@@ -136,6 +136,15 @@
 
   pre_tasks:
 
+    # Use controller_data_dir from the INVENTORY if it is set there (e.g. a custom
+    # /opt path you also used for the control-plane install); otherwise default to
+    # the controller's own path. This resolved value is written into the bundle's
+    # inventory.yml below so the execution node anchors the job private_data_dir
+    # (AWX_ISOLATION_BASE_PATH) at the SAME absolute path as the controller.
+    - name: Resolve controller_data_dir from the inventory (else the controller default)
+      ansible.builtin.set_fact:
+        controller_data_dir: "{{ controller_data_dir | default(aap_base_dir ~ '/controller/data') }}"
+
     - name: Validate node_hostname is defined and in inventory
       ansible.builtin.assert:
         that:
@@ -496,6 +505,8 @@
             vars:
               node_hostname: "{{ node_hostname }}"
               node_type: "{{ _node_type }}"
+              # Must match the controller so the job private_data_dir path lines up.
+              controller_data_dir: "{{ controller_data_dir }}"
               receptor_port: {{ _node_port }}
               receptor_protocol: "{{ _node_protocol }}"
               receptor_image: "{{ receptor_image }}"
