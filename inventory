@@ -48,6 +48,8 @@ bundle_install=true
 # The bundle directory must include /bundle in the path
 bundle_dir='{{ lookup("ansible.builtin.env", "PWD") }}/bundle'
 
+controller_data_dir='/opt/aap/controller/data'
+
 # Tell the installer to use SSL
 pg_sslmode='verify-full'
 # Tell the installer where the AWS cert is
