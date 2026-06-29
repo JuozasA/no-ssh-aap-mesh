@@ -13,6 +13,15 @@
 #   - node has _receptor_hostname, _receptor_type, receptor_peers set in inventory
 #   - community.crypto collection available (ships with AAP bundle)
 #
+# Custom receptor TLS (optional):
+#   If the node sets receptor_tls_cert and receptor_tls_key in inventory, those
+#   are imported verbatim instead of generating a cert from the mesh CA — the
+#   same as the installer's import branch in roles/receptor/tasks/tls.yml. The
+#   cert must carry the node ID in a SAN otherName (OID 1.3.6.1.4.1.2312.19.1).
+#   If the install used custom_ca_cert, that CA is staged on the controller as
+#   ~/aap/tls/custom.cert and is automatically folded into the bundle's
+#   mesh-CA.crt so the node can authenticate peers signed by it.
+#
 # -----------------------------------------------------------------------
 # TWO MODES — set installer_on_controller accordingly:
 #
@@ -83,6 +92,18 @@
     _node_protocol: "{{ hostvars[node_hostname]['_receptor_protocol'] | default('tcp') }}"
     _node_uuid:     "{{ hostvars[node_hostname]['_system_uuid'] }}"
 
+    # Custom receptor TLS — mirrors the installer's "Import TLS certificate and
+    # key" branch in roles/receptor/tasks/tls.yml. When the node sets both
+    # receptor_tls_cert and receptor_tls_key in inventory, we copy those into the
+    # bundle instead of generating a cert from the mesh CA. receptor_tls_remote
+    # follows the installer semantics: false (default) → the cert/key live on the
+    # machine running this playbook (the Ansible control/installer host) and are
+    # pushed to the controller; true → they already live on the controller.
+    _node_tls_cert:   "{{ hostvars[node_hostname]['receptor_tls_cert']   | default('') }}"
+    _node_tls_key:    "{{ hostvars[node_hostname]['receptor_tls_key']    | default('') }}"
+    _node_tls_remote: "{{ hostvars[node_hostname]['receptor_tls_remote'] | default(false) }}"
+    _node_custom_tls: "{{ (_node_tls_cert | length > 0) and (_node_tls_key | length > 0) }}"
+
     # Receptor settings (mirrors installer role defaults)
     receptor_log_level:       info
     receptor_mintls13:        false
@@ -106,6 +127,12 @@
     cert_locality: Raleigh
     cert_org:      "Red Hat"
     cert_ou:       Ansible
+
+    # Receptor node certificate validity, in days. The mesh CA / installer
+    # default is 3650 (10 years, community.crypto's ownca default); reduced to
+    # 1 year here. Re-run this playbook and redeploy the bundle before expiry.
+    # Override with: -e receptor_cert_validity_days=<n>
+    receptor_cert_validity_days: 365
 
   pre_tasks:
 
@@ -157,6 +184,7 @@
           Hostname  : {{ _node_hostname }}
           Peers     : {{ _node_peers | join(', ') }}
           Image     : {{ receptor_image }}
+          TLS cert  : {{ _node_custom_tls | bool | ternary('custom — imported from inventory (receptor_tls_cert/key)', 'generated from mesh CA') }}
 
   tasks:
 
@@ -175,49 +203,123 @@
         - certs
         - images
 
-    # TLS certificate — mirrors roles/receptor/tasks/tls.yml
-    - name: Generate node private key
-      community.crypto.openssl_privatekey:
-        path: "{{ bundle_staging_dir }}/certs/receptor.key"
-        mode: '0400'
+    # TLS certificate — mirrors roles/receptor/tasks/tls.yml, which has two
+    # mutually exclusive branches: GENERATE (no custom cert) and IMPORT (custom
+    # cert supplied). We pick the same branch the installer would for this node.
 
-    - name: Generate CSR for node
-      community.crypto.openssl_csr_pipe:
-        common_name: "{{ _node_hostname }}"
-        country_name: "{{ cert_country }}"
-        state_or_province_name: "{{ cert_state }}"
-        locality_name: "{{ cert_locality }}"
-        organization_name: "{{ cert_org }}"
-        organizational_unit_name: "{{ cert_ou }}"
-        subject_alt_name:
-          - "{{ _node_hostname | ansible.containerized_installer.subject_alt_name }}"
-          - "otherName:1.3.6.1.4.1.2312.19.1;UTF8:{{ _node_hostname }}"
-        privatekey_path: "{{ bundle_staging_dir }}/certs/receptor.key"
-      register: _receptor_tls_csr
+    # GENERATE branch — installer's "Generate TLS certificate and key" block.
+    # Runs when the node has no receptor_tls_cert/key in inventory.
+    - name: Generate node receptor certificate from the mesh CA
+      when: not _node_custom_tls | bool
+      block:
+        - name: Generate node private key
+          community.crypto.openssl_privatekey:
+            path: "{{ bundle_staging_dir }}/certs/receptor.key"
+            mode: '0400'
 
-    - name: Sign node certificate with mesh CA
-      community.crypto.x509_certificate:
-        path: "{{ bundle_staging_dir }}/certs/receptor.crt"
-        csr_content: "{{ _receptor_tls_csr.csr }}"
-        privatekey_path: "{{ bundle_staging_dir }}/certs/receptor.key"
-        provider: ownca
-        ownca_path: "{{ ca_tls_dir }}/ca.cert"
-        ownca_privatekey_path: "{{ ca_tls_dir }}/ca.key"
-        ownca_privatekey_passphrase: "{{ ca_tls_key_passphrase | default(omit) }}"
-        mode: '0640'
+        - name: Generate CSR for node
+          community.crypto.openssl_csr_pipe:
+            common_name: "{{ _node_hostname }}"
+            country_name: "{{ cert_country }}"
+            state_or_province_name: "{{ cert_state }}"
+            locality_name: "{{ cert_locality }}"
+            organization_name: "{{ cert_org }}"
+            organizational_unit_name: "{{ cert_ou }}"
+            subject_alt_name:
+              - "{{ _node_hostname | ansible.containerized_installer.subject_alt_name }}"
+              - "otherName:1.3.6.1.4.1.2312.19.1;UTF8:{{ _node_hostname }}"
+            privatekey_path: "{{ bundle_staging_dir }}/certs/receptor.key"
+          register: _receptor_tls_csr
 
-    - name: Copy mesh CA certificate into bundle
-      # Use ca.cert (the AAP mesh CA only) rather than the rendered mesh-CA.crt.
-      # mesh-CA.crt is produced by mesh-CA.crt.j2 and may concatenate additional
-      # CA certificates (e.g. custom_ca_cert, system CAs), which can push the bundle
-      # over receptor's 16KB QUIC crypto buffer limit, causing:
-      #   CRYPTO_BUFFER_EXCEEDED: received invalid offset NNN, maximum allowed 16384
-      # The receptor mesh only needs the AAP mesh CA to authenticate peer certificates.
-      ansible.builtin.copy:
+        - name: Sign node certificate with mesh CA
+          community.crypto.x509_certificate:
+            path: "{{ bundle_staging_dir }}/certs/receptor.crt"
+            csr_content: "{{ _receptor_tls_csr.csr }}"
+            privatekey_path: "{{ bundle_staging_dir }}/certs/receptor.key"
+            provider: ownca
+            ownca_path: "{{ ca_tls_dir }}/ca.cert"
+            ownca_privatekey_path: "{{ ca_tls_dir }}/ca.key"
+            ownca_privatekey_passphrase: "{{ ca_tls_key_passphrase | default(omit) }}"
+            # 1-year validity (default community.crypto ownca is +3650d / 10 years)
+            ownca_not_after: "+{{ receptor_cert_validity_days }}d"
+            mode: '0640'
+
+    # IMPORT branch — installer's "Import TLS certificate and key" block.
+    # Copies the user-supplied cert/key verbatim (same modes as the installer:
+    # 0640 cert, 0400 key) and honours receptor_tls_remote for the source side.
+    - name: Import custom node receptor certificate
+      when: _node_custom_tls | bool
+      block:
+        - name: Copy custom receptor certificate into bundle
+          ansible.builtin.copy:
+            src: "{{ _node_tls_cert }}"
+            dest: "{{ bundle_staging_dir }}/certs/receptor.crt"
+            mode: '0640'
+            remote_src: "{{ _node_tls_remote | bool }}"
+
+        - name: Copy custom receptor key into bundle
+          ansible.builtin.copy:
+            src: "{{ _node_tls_key }}"
+            dest: "{{ bundle_staging_dir }}/certs/receptor.key"
+            mode: '0400'
+            remote_src: "{{ _node_tls_remote | bool }}"
+
+        # Mirrors preflight/tasks/nodes.yml: a receptor cert MUST carry the node
+        # ID in a SAN otherName with OID 1.3.6.1.4.1.2312.19.1, or the mesh will
+        # not authenticate the node. Validated on the staged copy (always local
+        # to this host) so it works regardless of receptor_tls_remote.
+        - name: Read imported receptor certificate info
+          community.crypto.x509_certificate_info:
+            path: "{{ bundle_staging_dir }}/certs/receptor.crt"
+          register: _imported_cert_info
+
+        - name: Ensure imported receptor certificate uses SAN extension with OID
+          ansible.builtin.assert:
+            that:
+              - _imported_cert_info.subject_alt_name is defined
+              - _imported_cert_info.subject_alt_name | select('match', '^otherName:1.3.6.1.4.1.2312.19.1') | length > 0
+            fail_msg: >-
+              Custom receptor certificate for {{ node_hostname }} is missing the
+              required SAN otherName OID (1.3.6.1.4.1.2312.19.1). The receptor mesh
+              will not authenticate this node without its node ID in that field.
+
+    # Mesh CA trust bundle — mirrors roles/receptor/templates/mesh-CA.crt.j2,
+    # which renders the internal mesh CA (ca.cert) followed by custom_ca_cert
+    # (staged on the controller as custom.cert by common/tasks/tls.yml) when it
+    # was set at install time.
+    #
+    # custom.cert is REQUIRED in the bundle for the Case-2 import branch: when a
+    # node's custom receptor cert is signed by a CA other than the internal mesh
+    # CA, the node must trust that CA to authenticate controller/peer certs (and
+    # vice-versa). When there is no custom CA we ship ca.cert alone, keeping the
+    # bundle minimal to stay under receptor's 16KB QUIC crypto buffer limit:
+    #   CRYPTO_BUFFER_EXCEEDED: received invalid offset NNN, maximum allowed 16384
+    # Only the AAP mesh CA(s) are concatenated here — never the full system trust.
+    - name: Check for a custom CA on the controller
+      ansible.builtin.stat:
+        path: "{{ ca_tls_dir }}/custom.cert"
+      register: _custom_ca_stat
+
+    - name: Read internal mesh CA certificate
+      ansible.builtin.slurp:
         src: "{{ ca_tls_dir }}/ca.cert"
+      register: _mesh_internal_ca
+
+    - name: Read custom CA certificate when present
+      ansible.builtin.slurp:
+        src: "{{ ca_tls_dir }}/custom.cert"
+      register: _mesh_custom_ca
+      when: _custom_ca_stat.stat.exists
+
+    - name: Assemble mesh CA bundle into the node bundle
+      ansible.builtin.copy:
         dest: "{{ bundle_staging_dir }}/certs/mesh-CA.crt"
         mode: '0644'
-        remote_src: true
+        content: |
+          {{ _mesh_internal_ca.content | b64decode }}
+          {%- if _custom_ca_stat.stat.exists %}
+          {{ _mesh_custom_ca.content | b64decode }}
+          {%- endif %}
 
     - name: Copy work signing public key into bundle
       ansible.builtin.copy:
