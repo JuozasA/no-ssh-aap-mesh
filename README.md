@@ -1,244 +1,267 @@
-# AAP Containerized - Non-SSH Execution/Hop Node Setup Guide
+# AAP 2.7 Containerized — Remote Automation Mesh Deployment
 
-# **Overview**
+Not the official Red Hat documentation. For the Support Exception for this Deployment type, reach out to your Red Hat Account Team.
 
-This guide explains how to install AAP containerized with a mixed execution node topology:
+## Overview
 
--   AAP control plane (Gateway, Controller, Hub, EDA) - SSH accessible, installed by the main AAP installer.
+| Aspect | This deployment |
+|--------|-----------------|
+| Database | **External AWS RDS PostgreSQL** (admin-credentials mode — the installer creates the component DBs/roles using the RDS master account) |
+| Control plane | `automationcontroller` (×2), `automationgateway`, `automationhub`, `automationmetrics`, `redis` — reachable over SSH from the installer host |
+| Execution mesh | Hop / execution nodes installed **out-of-band** via a self-contained bundle (no SSH from the installer) |
+| Receptor TLS | Custom per-node certificates signed by a custom mesh CA (`custom_ca_cert`) |
 
--   Execution/Hop nodes SSH accessible, installed automatically by the main AAP installer alongside the control plane.
+Two facts drive most of the procedures below:
 
--   Execution/Hop nodes no SSH from the installer machine. Installed via the bundle approach described in this guide.
+1. **The external DB is RDS** 
+2. **The mesh nodes are out-of-band** — they are not reachable by the installer.
+---
 
-Key concept --- receptor topology direction:
+## Architecture, components & sizing
 
--   Hop nodes dial OUTBOUND to the AAP Controllers (hop → controllers).
+### Components
 
--   Controllers do NOT dial to Hop nodes.
+AAP 2.7 is fronted by the **Platform Gateway**, which is the single entry point (UI/API) and reverse-proxies to the backend services. Each service runs as rootless podman containers managed by user-level systemd.
 
--   This means Hop nodes only need outbound access to Controller port 27199. They do NOT need inbound port 27199 from the Controllers.
+| Component | Role | Notes |
+|-----------|------|-------|
+| **Platform Gateway** | Front door — auth, routing, UI/API aggregation | User-facing on 80/443 (Envoy). Uses Redis. |
+| **Automation Controller** | Job execution, inventories, projects, RBAC | Dispatches work across the receptor mesh. |
+| **Automation Hub** | Private content (collections, EEs) | Storage-heavy; backend can be `file`/S3/Azure. |
+| **Automation EDA** | Event-Driven Ansible | Optional. |
+| **Automation Metrics** | Metrics/analytics service | Reads the controller DB via a read-only user. |
+| **Redis** | Shared cache / message backend | Standalone or cluster (see below). |
+| **Receptor mesh** | Control ↔ execution/hop node transport | mTLS on 27199. |
+| **PostgreSQL** | Backing database | **External AWS RDS** in this deployment. |
 
--   Execution nodes dial outbound to their Hop node (execution → hop).
+### Reference topologies
 
--   Hop nodes DO need inbound port 27199 open from the Execution node's network.
+Red Hat documents two reference topologies for containerized AAP 2.7 (see the [install guide PDF](https://docs.redhat.com/en/documentation/red_hat_ansible_automation_platform/2.7/pdfs/aap-install-2-7-pdf.pdf)). Both use the **same traffic flows** (80/443 ingress, 5432 DB, 6379 Redis, 27199 receptor); they differ in redundancy.
 
-# **Prerequisites**
+| | **AIO Growth** (all-in-one) | **Enterprise** (multi-node) |
+|---|-----------|----------------|
+| Inventory file | `inventory-growth` (`ansible_connection=local`) | `inventory` (the default) |
+| Component instances | one of each, colocated on a single host | redundant (e.g. 2× gateway / controller / hub / EDA / metrics) |
+| Database | containerized `[database]` host **or** external | **external** (e.g. AWS RDS) |
+| Redis | **standalone** | **cluster** (≥ 6 instances, one per control-plane VM) |
+| Front end | direct to the gateway | **HA load balancer / proxy** in front of the gateways (443) |
+| Execution mesh | optional | hop node(s) + execution node(s) over receptor |
+| Use | dev / test / small production | large-scale production / HA |
 
-## **Node requirements:**
+**This deployment follows the Enterprise topology:** external AWS RDS, redundant automation controllers, Redis across the control plane, and an out-of-band execution mesh (hop + execution nodes). If you run more than one gateway, put a load balancer in front of them on 443 (the diagram's "HA proxy / load balancer").
 
--   RHEL 9.2+
 
--   ansible-core installed: dnf install ansible-core
+### Ports & firewall rules
 
--   sudo / become access for the service user
+The installer opens these via `firewalld` (zone `public` by default) **only when firewalld is enabled**. Backend app ports (uwsgi/daphne/gunicorn/api: 8050/8051/8052, 8000/8001, 24816/24817) bind to localhost and are **not** firewalled.
 
--   Outbound TCP 27199 to peer nodes (hop → controllers, exec → hop)
+**Required flows:**
 
--   Inbound TCP 27199 from child nodes (hop node needs inbound from exec node network)
+| Flow | Port(s) | Proto | Purpose |
+|------|---------|-------|---------|
+| Clients → Gateway | **443** (and 80) | tcp | Platform UI/API (Envoy front door) |
+| Admin/installer → all control-plane nodes | **22** | tcp | SSH (passwordless + sudo) |
+| Gateway → backend services *(distributed only)* | 8443 (controller), 8444 (hub), 8445 (eda), 8450 (metrics), 8446 (gateway nginx) | tcp | Reverse-proxy to each service's nginx |
+| Control plane ↔ Redis | **6379** (+ **16379** cluster bus) | tcp | Cache / message backend |
+| Controller/Gateway/Hub/EDA/Metrics → **RDS** | **5432** | tcp | PostgreSQL (RDS security group, not firewalld) |
+| Controller ↔ execution/hop nodes | **27199** | tcp | Receptor mesh (mTLS) |
+| (optional) monitoring → control plane | 44321 / 44322 | tcp | Performance Co-Pilot (`setup_monitoring=true`) |
 
--   No inbound port 27199 needed from controllers (hop dials out, not controllers)
+Per-service ports the installer opens (http / https): controller 8080/8443 · hub 8081/8444 · eda 8082/8445 · gateway 8083/8446 (+ Envoy 80/443) · metrics 8087/8450. On a single colocated node these are loopback; on a distributed control plane they must be reachable between nodes.
 
-## **Installer machine requirements:**
+> RDS note: the `:5432` rule is an **AWS security group** ingress from the control-plane subnet — there is no firewalld rule because the DB isn't an AAP-managed host.
 
--   AAP bundle downloaded and extracted (e.g. ansible-automation-platform-containerized-setup-bundle-2.6-5-x86_64/)
+### Sizing per VM
 
--   Main installer has completed successfully against the control plane
+The install guide specifies the **same minimum for every VM** (the installer enforces only the RAM check, `ansible_memtotal_mb >= 15000`; **hop nodes are exempt**):
 
--   community.crypto collection available (ships with the AAP bundle)
+| Resource | Minimum |
+|----------|---------|
+| RAM | **16 GB** — *32 GB* for a Growth bundled install with `hub_seed_collections=true` |
+| CPU | **4 vCPU** |
+| Local disk | **60 GB total** |
+| Disk IOPS | **3000** |
 
-# **Files You Need to Create or Modify**
+Disk breakdown within that 60 GB:
 
-Three files are involved:
+| Path | Minimum |
+|------|---------|
+| Installation directory (if on its own partition) | 15 GB |
+| `/tmp` (offline / bundled install) | 10 GB |
+| `/var/tmp` (bundled / offline; 1 GB online) | 3 GB |
+| `/var/lib/containers` (image storage) | 10 GB |
 
--   inventory - modified to add the child-group structure for execution nodes
+Role-specific notes:
+- **Hub** content (collections, EEs) grows well beyond the minimum — size its disk for what you sync.
+- **Metrics service** can run smaller (2 vCPU / 4 GB) and needs ~20–40 GB for the `metrics_service` database (on the RDS side here).
+- **Where storage goes (rootless):** images/containers live under the install user's **home** (`~/.local/share/containers` + `~/aap/containers/storage` for EE images) and runtime data under `~/aap` — put the bulk of the disk on the home filesystem. **Podman does not support image storage on NFS.**
 
--   generate-exec-node-bundle.yml - new playbook, placed in the installer root directory
+### Redis: standalone vs cluster
 
--   install-exec-node.yml - new playbook, placed in the installer root directory
+`redis_mode` defaults to **`cluster`**. TLS is on by default (`redis_disable_tls=false`).
 
-# **Step 1 - Update the Inventory**
+| Mode | Set | Nodes | HA | When |
+|------|-----|-------|----|----|
+| **Cluster** (default) | `redis_mode=cluster` | **≥ 6 Redis instances** (3 primary + 3 replica; `redis_cluster_replicas=1`) across the `[redis]` group | Yes | Production / HA control plane |
+| **Standalone** | `redis_mode=standalone` | 1 instance | No | Small / non-HA footprints, or fewer than 6 nodes |
 
-## **1a. Controller section --- prevent auto-assignment**
+Notes:
+- In cluster mode the `[redis]` inventory group must contain at least 6 hosts; the cluster uses the **bus port 16379** in addition to 6379.
+- The Gateway connects to Redis on **6379**; Controller and Hub also use a local Redis over a **unix socket** (no extra port).
+- Choosing standalone removes Redis as an HA dependency but makes it a single point of failure — fine for labs/PoCs, not recommended for production.
 
-Add these group vars to [automationcontroller]. They prevent the installer from auto-assigning execution nodes directly to controllers (which would break topology when those exec nodes are excluded from the **--limit**):
-```
-[automationcontroller]
-automationcontroller-1.example.com
-automationcontroller-2.example.com
+---
 
-[automationcontroller:vars]
-# receptor_peers (no underscore) --- prevents installer auto-assigning exec node directly to controllers
-receptor_peers=[]
-# _receptor_peers (with underscore) --- init.yml Jinja2 guard for excluded node processing
-_receptor_peers=[]
-```
-Why both? The installer's init.yml reads **_receptor_peers** (underscore) from hostvars for ALL execution nodes to build receptor topology. For excluded (non-SSH) nodes, facts.yml never runs so **_receptor_peers** would be undefined causing template generation to crash. Setting **_receptor_peers=[]** everywhere prevents this.
-**receptor_peers** (no underscore) is the input variable that controls topology assignment.
+## Prerequisites
 
-## **1b. Execution nodes --- child group structure**
+- **RHEL 9.2 or later** on every node (RHEL 8 is **not** supported; RHEL 10 is also supported). Each host needs an **FQDN** hostname (`hostname -f`).
+- A **dedicated non-root user** with `sudo` on each node — this user both runs the install and is the service account for the containers.
+- Each VM meets the [sizing minimums](#sizing-per-vm): 16 GB RAM, 4 vCPU, 60 GB disk, 3000 IOPS.
+- `ansible-core`, `podman`, and `psql` on the installer host (`sudo dnf install -y ansible-core postgresql`).
+- Passwordless SSH (public-key) from the installer host to every **control-plane** node, with passwordless `sudo`.
+- An **external PostgreSQL** instance (AWS RDS here): **PostgreSQL 15, 16, or 17**, with **ICU support** (a hard requirement for external DBs), reachable on `:5432` from the control-plane subnet. Note: external PG 16/17 rely on external backup/restore (the built-in backup uses PG15 utilities).
 
-Replace any existing [execution_nodes] section with this child-group pattern:
-```
-[execution_nodes:children]
-ssh_execution_nodes
-nossh_execution_nodes
+### About `custom_ca_cert`
 
-[execution_nodes:vars]
-_receptor_peers=[]
-_receptor_protocol=tcp
-_receptor_port=27199
+`custom_ca_cert` is a **single** file that the installer uses for **two** things at once:
 
-[ssh_execution_nodes]
-ssh-hop-1.example.com receptor_peers=["automationcontroller-1.example.com","automationcontroller-2.example.com"] receptor_type=hop
-ssh-exec-1.example.com receptor_peers=["aws-hop-1.example.com"] receptor_type=execution
+- it is added to the in-container system trust (`/etc/pki/tls/certs/ca-bundle.crt`), which every component uses as `sslrootcert` for Postgres `verify-full`; **and**
+- it is concatenated into receptor's `mesh-CA.crt`.
 
-[nossh_execution_nodes]
-no-ssh-hop.example.com receptor_peers=["automationcontroller-1.example.com","automationcontroller-2.example.com"] _receptor_hostname=no-ssh-hop.example.com _receptor_type=hop _system_uuid=ec2a2b88-a646-74b8-3053-e2beec
-no-ssh-exec.example.com receptor_peers=["no-ssh-hop.example.com"] _receptor_hostname=on-prem-exec.example.com _receptor_type=execution _system_uuid=ec2824db-c7ab-bcde-b3a1-c7eee
-```
-## **1c. Variable naming rules**
+So when you use both custom receptor certs **and** RDS `verify-full`, `custom_ca_cert` must contain **both** the receptor mesh CA and the RDS CA. Because it lands in `mesh-CA.crt`, it is bound by receptor's ~16 KB QUIC limit — **use the regional RDS bundle (~4–5 KB), never the global one (~165 KB)**, which would break the mesh with `CRYPTO_BUFFER_EXCEEDED`. The merged file is `receptor-tls/custom-ca-bundle.pem`.
 
-For SSH-accessible nodes (e.g. [ssh_execution_nodes]):
+---
 
--   Use receptor_type=hop (NO underscore) for hop nodes. Omit entirely for execution nodes (role default is 'execution').
+## Installation
 
--   Do NOT set _system_uuid - it is auto-discovered from ansible_product_uuid / ansible_machine_id by facts.yml.
+### 1. Inventory
 
--   Do NOT set _receptor_type (UNDERSCORE) directly - facts.yml reads receptor_type and converts it to _receptor_type via set_fact. If you set _receptor_type in inventory, facts.yml will overwrite it with the role default ('execution').
+Set the RDS connection and admin credentials, the component DB names/users, the receptor TLS vars, and `custom_ca_cert`. Example (abbreviated):
 
-For non-SSH nodes (e.g. [nossh_execution_nodes]):
+```ini
+[all:vars]
+postgresql_admin_username=<rds-master-user>
+postgresql_admin_password=<rds-master-password>
+custom_ca_cert=/abs/path/receptor-tls/custom-ca-bundle.pem
 
--   Use _receptor_type=hop (WITH underscore) - facts.yml never runs so you must provide the underscore form directly.
-
--   _system_uuid MUST be set - it cannot be auto-discovered. Obtain it from the node:
-
-    -   `cat /sys/class/dmi/id/product_uuid` or `cat /etc/machine-id`
-
--   _receptor_hostname MUST be set - the FQDN/hostname receptor advertises to the mesh.
-
--   receptor_peers MUST be set - the list of peers this node dials out to (JSON array format).
-
-# **Step 2 - generate-exec-node-bundle.yml**
-
-## **What this playbook does**
-
-generate-exec-node-bundle.yml runs ON the first AAP controller node (not on the target exec/hop node). It:
-
-1.  Reads TLS certificates and the CA key from the controller's `~/aap/tls/` directory (created by the main installer).
-
-2.  Generates a new TLS certificate for the target node, signed by the mesh CA.
-
-3.  Reads node properties (_receptor_type, receptor_peers, etc.) from the inventory hostvars.
-
-4.  Renders a receptor.conf using the same template as the installer.
-
-5.  Registers the node's peer links in the database (awx-manage register_peers) - this is what makes the node appear in AAP's Topology View.
-
-6.  Copies the receptor container image (and EE images for execution nodes) from the installer bundle.
-
-7.  Bundles the Ansible collections (containers.podman, ansible.posix) needed to run install-exec-node.yml offline.
-
-8.  Packages everything into a self-contained tarball: `~/receptor-bundle-<hostname>.tar.gz`.
-
-9.  Fetches the tarball back to the installer machine.
-
-Two modes:
-
--   Mode A (default, installer_on_controller=false): Installer is on a separate machine. Images are pushed from the installer to the controller during staging.
-
--   Mode B (installer_on_controller=true): Installer runs on the same machine as the controller. Images are read locally.
-
-# **Step 3 - install-exec-node.yml**
-
-## **What this playbook does**
-
-install-exec-node.yml is packaged inside the bundle tarball and runs ON the hop/execution node itself (not on the installer machine or controller). It:
-
-1. Installs prerequisites: podman, crun, podman-remote, slirp4netns, fuse-overlayfs, polkit.
-
-2. Creates the AAP directory structure under `~/aap/` (mirroring the installer's roles/common layout).
-
-3. Sets the SELinux context data_home_t on `~/aap/containers/storage` --- this is critical: it triggers a SELinux type transition so the podman daemon labels image layer files as `container_file_t` (which EE container processes can read).
-
-4. Configures podman: containers.conf (crun runtime), storage.conf (custom storage path), podman.service.d/override.conf (daemon storage config), podman wrapper script.
-
-5. Extracts the CA trust bundle into `~/aap/tls/extracted/` (bind-mounted into the receptor container).
-
-6. Deploys receptor.conf and TLS certificates into `~/aap/receptor/etc/`.
-
-7. Creates named podman volumes: receptor_run, receptor_runner, receptor_home, receptor_data.
-
-8. Loads container images from the bundle (receptor + EE images for execution nodes).
-
-9. Creates the receptor container with all required volume mounts and generates a systemd unit file.
-
-10. Enables and starts receptor.service (user scope).
-
-11. Opens port `27199/tcp` in firewalld if running.
-
-12. Verifies the receptor service is active.
-
-# **Step 4 - Run the Main AAP Installer**
-
-Run the installer, excluding non-SSH node groups:
-```
-cd /<path>/<to>/<bundle>/ansible-automation-platform-containerized-setup-bundle-2.6-5-x86_64/
-
-ansible-playbook -i inventory ansible.containerized_installer.install --limit 'all:!nossh_execution_nodes'
-```
-This installs the control plane (Gateway, Controller, Hub, EDA) and any SSH-accessible execution nodes, but skips no-ssh nodes.
-
-Wait for the installer to complete successfully before proceeding. Verify in the AAP UI:
-
--   Administration → Instances --- all control plane nodes show as Running
-
--   The installer creates the mesh CA, receptor certificates, and the signing key on the controller - these are required by generate-exec-node-bundle.yml
-
-# **Step 5 - Generate Bundle for Each Non-SSH Node**
-
-Run once per node, always starting with the hop node (execution nodes peer to the hop, so the hop must be registered first).
-
-## **5a. Hop node**
-```
-ansible-playbook -i inventory generate-exec-node-bundle.yml -e node_hostname=no-ssh-hop.example.com
-
-Output: ~/receptor-bundle-no-ssh-hop.example.com.tar.gz
-```
-## **5b. Execution node**
-```
-ansible-playbook -i inventory generate-exec-node-bundle.yml -e node_hostname=no-ssh-exec.example.com
-
-Output: ~/receptor-bundle-no-ssh-exec.example.com.tar.gz
-```
-## **5c. If installer runs on the controller (Mode B)**
-```
-ansible-playbook -i inventory generate-exec-node-bundle.yml -e node_hostname=<hostname> -e installer_on_controller=true
+controller_pg_host=<rds-endpoint>
+controller_pg_database=ctrl-db
+controller_pg_username=postgres-ctrl
+controller_pg_password=...
+controller_pg_sslmode=verify-full
+# ... gateway_/hub_/eda_/automationmetrics_ equivalents, each *_pg_sslmode=verify-full
 ```
 
-# **Step 6 - Transfer Bundle to the Node**
+### 2. Exclude the out-of-band mesh nodes from the installer run
 
-# **Step 7 - Install on the Node**
+The hop/execution nodes are not reachable by the installer, so they are excluded from the `install` run with **`--limit '!execution_nodes'`** (applied in the next step). **Keep them in the inventory — do not comment them out.**
 
-SSH onto the node (or use whatever access method is available - console, serial, jump host)
+> ⚠️ Commenting the nodes out removes them from the inventory, which makes the controller's `init.yml` *"Deprovision Instances not listed in the inventory"* task (`awx-manage deprovision_instance`) drop them from the mesh database. `--limit` keeps them in `groups['execution_nodes']` (so the controller registers them in the DB) while preventing Ansible from connecting to the unreachable hosts.
 
-Install ansible-core if not already present:
+### 3. Run the installer (control plane)
 
-`sudo dnf install -y ansible-core`
-
-Extract the bundle and run the playbook:
+```bash
+ansible-playbook -i inventory ansible.containerized_installer.install --limit '!execution_nodes'
 ```
-tar -xzf receptor-bundle-<hostname>.tar.gz
-cd receptor-bundle-<hostname>/
+
+This installs the control plane and the controllers' own receptor instances, creates the remaining component databases on RDS, and registers the (still-excluded) mesh nodes in the controller database so they're ready for their bundles.
+
+### 4. Build and deploy the mesh-node bundles
+
+The mesh nodes stay in the inventory throughout. For each hop/execution node, build its bundle on the controller (the generator reads the node's vars from the inventory and connects only to the controller):
+
+```bash
+ansible-playbook -i inventory generate-exec-node-bundle.yml -e node_hostname=hop-node.srbbx.azure.redhatworkshops.io
+```
+
+The tarball is fetched back to `~/receptor-bundle-<node>.tar.gz`. Copy it to the node and install:
+
+```bash
+tar -xzf receptor-bundle-<node>.tar.gz && cd receptor-bundle-<node>/
 ansible-playbook install-exec-node.yml -i inventory.yml
 ```
-Repeat Steps 5--7 for each non-SSH node. Always install the hop node before the execution node.
 
-# **Step 8 - Verify in AAP**
+If you use custom receptor certs, set `receptor_tls_cert`/`receptor_tls_key` on the node's inventory line first — the bundle generator imports them and folds `custom_ca_cert` into the node's `mesh-CA.crt`. (This requires the controllers to have been installed **with** `custom_ca_cert` set, so `~/aap/tls/custom.cert` exists on them.)
 
-1. Log into the AAP UI.
+### 5. Verify
 
-2. Go to Instances.
+- Control plane: `podman ps` on each host; log in to the platform UI.
+- Mesh: on each node `systemctl --user status receptor.service`, then in the UI **Administration → Topology View** / **Instances** should show the hop/execution nodes healthy.
+- Custom certs in use (on a node): `openssl x509 -in ~/aap/receptor/etc/receptor.crt -noout -issuer` should show your custom CA, not `CN=Ansible Automation Platform`.
 
-3. Confirm both the hop and execution nodes show status: Ready.
+---
 
-4. Go to Topology View to confirm the mesh topology is correct.
+## Uninstallation
+
+> **Order matters.** The host cleanup regenerates secrets and the RDS wipe clears encrypted data — they are a matched pair. Doing one without the other leaves a half-state.
+
+### 1. Exclude the out-of-band mesh nodes
+
+The uninstall playbook would try to reach them and fail (`any_errors_fatal`), so exclude them with **`--limit '!execution_nodes'`** (applied in the next step). Commenting them out also works here — `uninstall.yml` doesn't run the deprovision task and the RDS database is wiped anyway — but `--limit` keeps it consistent with install/upgrade.
+
+### 2. Run the uninstall playbook (control plane)
+
+```bash
+ansible-playbook -i inventory ansible.containerized_installer.uninstall --limit '!execution_nodes'
+```
+
+### 3. Wipe the RDS databases and roles
+
+The uninstall does **not** touch RDS. Drop the AAP databases/roles so a fresh install doesn't collide.
+
+### 4. Clean the control-plane hosts
+
+Removes the `~/aap` dir, podman volumes/secrets/images, systemd units, `~/.config/containers` left behind by the playbook.
+
+### 5. Clean the hop/execution nodes manually
+
+The playbook can't reach them — clean each one on the node itself.
+
+---
+
+## Upgrades
+
+An upgrade is an **in-place re-run of the installer from a newer bundle against the existing databases** — you do **not** wipe RDS, and you do **not** clean the hosts (that would destroy the secret keys needed to decrypt existing DB data).
+
+### 1. Stage the new bundle
+
+1. Download and extract the new AAP 2.7 bundle into a new directory.
+2. Copy your deployment files into it:
+   - `inventory`
+   - `generate-exec-node-bundle.yml` and `install-exec-node.yml`
+   - the custom certificates (including `custom-ca-bundle.pem`)
+3. Update absolute paths in the inventory if the new directory path differs.
+
+### 2. Exclude the out-of-band mesh nodes with `--limit` — **do not comment them out**
+
+The hop/execution nodes are not reachable by the installer, so they must be excluded from the upgrade run. **Use `--limit '!execution_nodes'`, not commenting** (the install command in the next step applies it).
+
+> ⚠️ **Never comment out the mesh nodes for an upgrade.** The controller's `init.yml` has a *"Deprovision Instances not listed in the inventory"* task (`awx-manage deprovision_instance`). A node absent from the inventory is **removed from the mesh database**. `--limit` keeps the nodes in `groups['execution_nodes']` so they stay registered — registration runs as `awx-manage` on the controller and never needs to reach them — while keeping Ansible from connecting to the unreachable hosts.
+
+### 3. Upgrade the control plane
+
+From the new bundle directory:
+
+```bash
+ansible-playbook -i inventory ansible.containerized_installer.install --limit '!execution_nodes'
+```
+
+The installer pulls the new images, runs DB migrations against the existing RDS databases, and recreates the services. (Because the hosts are untouched, the existing secret keys still decrypt the existing DB data.) The `--limit` keeps the mesh nodes registered (see step 2).
+
+### 4. Upgrade the mesh
+
+Regenerate each node's bundle from the new version and redeploy:
+
+```bash
+# on the controller (mesh nodes remain in the inventory):
+ansible-playbook -i inventory generate-exec-node-bundle.yml -e node_hostname=<node>
+# copy the tarball to the node, then on the node:
+tar -xzf receptor-bundle-<node>.tar.gz && cd receptor-bundle-<node>/
+ansible-playbook install-exec-node.yml -i inventory.yml
+```
+
+`install-exec-node.yml` recreates the receptor container from the new image (`recreate: true`), so the same command upgrades the node in place.
+
+### 5. Verify
+
+Same checks as install step 5: control-plane containers, mesh Topology View, and that all nodes report the new version.
