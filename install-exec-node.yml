@@ -52,7 +52,9 @@
     # Mirrors installer role defaults
     receptor_conf_dir:   "{{ aap_base_dir }}/receptor/etc"
     ca_tls_dir:          "{{ aap_base_dir }}/tls"
-    controller_data_dir: "{{ aap_base_dir }}/controller/data"
+    # controller_data_dir is resolved in the first task — it comes from the bundle's
+    # inventory.yml (set by generate-exec-node-bundle.yml to the CONTROLLER's path)
+    # and falls back to this node's home. It MUST equal the controller's value.
     aap_podman_path:     "{{ aap_base_dir }}/containers/podman"
     aap_storage_conf:    "{{ aap_base_dir }}/containers/storage.conf"
 
@@ -85,6 +87,30 @@
         label: "{{ item.item }}"
 
   tasks:
+
+    # ------------------------------------------------------------------
+    # 0. Resolve controller_data_dir (carried from the bundle's inventory.yml,
+    #    else default to this node's home). It MUST equal the controller's path:
+    #    the job private_data_dir (AWX_ISOLATION_BASE_PATH) is an absolute path
+    #    recreated verbatim on this node. Create it owned by the service user with
+    #    become, since the path may live outside the user's home (e.g. /opt).
+    # ------------------------------------------------------------------
+    - name: Resolve controller_data_dir
+      ansible.builtin.set_fact:
+        controller_data_dir: "{{ controller_data_dir | default(aap_base_dir ~ '/controller/data') }}"
+
+    - name: Ensure controller_data_dir exists and is owned by the service user
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ ansible_user_id }}"
+        group: "{{ ansible_user_id }}"
+        mode: '0770'
+      become: true
+      loop:
+        - "{{ controller_data_dir }}"
+        - "{{ controller_data_dir }}/job_execution"
+        - "{{ controller_data_dir }}/projects"
 
     # ------------------------------------------------------------------
     # 1. Install prerequisites
